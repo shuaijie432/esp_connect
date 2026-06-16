@@ -27,18 +27,23 @@ class Navigator:
         # 机器人物理尺寸（mm）
         # 底盘支持平移过窄道，膨胀基准用车宽/2（直行通过所需最小半宽），
         # 而非外接圆半径（那是旋转时才需要的）。
-        self.robot_width_mm = 270.0           # 27cm 车身宽度
-        self.robot_length_mm = 270.0          # 27cm 车身长度
+        self.robot_width_mm = 330.0           # 27cm 车身宽度
+        self.robot_length_mm = 320.0          # 27cm 车身长度
         self.robot_radius_mm = self.robot_width_mm / 2.0   # 135mm
-        self.safety_margin_mm = 30.0          # 安全余量（可据实际调整）
-        self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 165mm
+        self.safety_margin_mm = 100.0          # 从 30 加大到 80，给定位误差和车身凸出留足余量
+        self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 215mm
 
         # 膨胀栅格数 = ceil(total_inflation / resolution)
-        # 165/15 = 11 栅格
-        # self.obstacle_margin = max(4, int(math.ceil(self.total_inflation_mm / self.mapper.map.resolution)))
+        # 膨胀必须覆盖 robot_radius + safety_margin，且要额外补偿车身对角线(212mm)和定位误差
+        # self.obstacle_margin = max(4, int(math.ceil(self.total_inflation_mm / self.mapper.map.resolution)) + 2)
+        # print(f"[NAV] 膨胀半径: {self.obstacle_margin} 栅格 = {self.obstacle_margin * self.mapper.map.resolution:.0f}mm "
+        #       f"(机器人半径{self.robot_radius_mm:.0f}mm + 安全余量{self.safety_margin_mm:.0f}mm + 对角线补偿)")
+        # 膨胀半径 = ceil(总膨胀距离 / 分辨率) + 2（补偿对角线和定位误差）
+        # 总膨胀 = 机器人半径165mm + 安全余量100mm = 265mm → ceil(265/15) + 2 = 20格 = 300mm
+        # self.obstacle_margin = max(4, int(math.ceil(self.total_inflation_mm / self.mapper.map.resolution)) + 2)
         # print(f"[NAV] 膨胀半径: {self.obstacle_margin} 栅格 = {self.obstacle_margin * self.mapper.map.resolution:.0f}mm "
         #       f"(机器人半径{self.robot_radius_mm:.0f}mm + 安全余量{self.safety_margin_mm:.0f}mm)")
-        self.obstacle_margin = 4  # 对应 120mm 膨胀
+        self.obstacle_margin =6
         self.replan_threshold = 200.0
 
         self.replan_interval = 1.0
@@ -62,8 +67,8 @@ class Navigator:
         self._plan_frozen = False
 
         # 速度参数（底盘支持平移）
-        self.MAX_VX = 150.0
-        self.MAX_VY = 80.0
+        self.MAX_VX = 100.0   # 从 150 降低，窄道中有更多反应时间
+        self.MAX_VY = 100.0   # 从 80 提高，底盘支持平移，侧向逃避需要更大速度
         self.MAX_VW = 0.5
         self.KP_V = 0.5
         self.KP_W = 1.2
@@ -93,8 +98,10 @@ class Navigator:
 
         # 动态窗口避障参数
         self._dw_enabled = True
-        self._dw_safe_distance = 500.0
-        self._dw_critical_distance = 300.0
+        # 四周统一安全距离：车头/车尾/侧方都使用同样的阈值
+        self._uniform_clearance = 250.0   # 四周统一安全余量 mm
+        self._dw_safe_distance = 180.0    # 前方 150mm 开始减速（给 120mm 留缓冲）
+        self._dw_critical_distance = 140.0  # 前方 120mm 停止
         self._dw_lateral_gain = 1.5
 
         # 卡住检测参数（长时间卡住才重规划）
@@ -151,7 +158,7 @@ class Navigator:
         for wx, wy in world_pts:
             dist = math.hypot(wx - robot_x, wy - robot_y)
             # 忽略自身附近和太远的点，防止雷达噪声和远距离误检
-            if dist < 200 or dist > 8000:
+            if dist < 80 or dist > 8000:
                 continue
 
             mx, my = grid.world_to_map(wx, wy)
@@ -185,11 +192,11 @@ class Navigator:
         # 3. 合并两种占用
         combined_occ = static_occ | pc_occ
 
-        # 4. 将机器人所在位置及其周围强制设为可通行（范围需覆盖膨胀半径）
+        # 4. 将机器人所在位置及其周围极小范围设为可通行。
+        # 注意：清空半径不能太大，否则会制造"人造空洞"，导致A*路径贴着墙壁走。
         rx, ry = grid.world_to_map(robot_x, robot_y)
-        clear_radius = self.obstacle_margin + 2
-        for dx in range(-clear_radius, clear_radius + 1):
-            for dy in range(-clear_radius, clear_radius + 1):
+        for dx in range(-2, 3):
+            for dy in range(-2, 3):
                 nx, ny = rx + dx, ry + dy
                 if 0 <= nx < grid.size and 0 <= ny < grid.size:
                     combined_occ[ny, nx] = False
@@ -210,9 +217,9 @@ class Navigator:
                     padded[1:-1, 2:]
                 )
 
-        # 膨胀后再次确保机器人栅格可通行
-        for dx in range(-clear_radius, clear_radius + 1):
-            for dy in range(-clear_radius, clear_radius + 1):
+        # 膨胀后只确保机器人中心栅格可通行（不要挖大洞）
+        for dx in range(-1, 2):
+            for dy in range(-1, 2):
                 nx, ny = rx + dx, ry + dy
                 if 0 <= nx < grid.size and 0 <= ny < grid.size:
                     inflated[ny, nx] = False
@@ -501,7 +508,8 @@ class Navigator:
             local_x = dx * math.cos(robot_theta) + dy * math.sin(robot_theta)
             local_y = -dx * math.sin(robot_theta) + dy * math.cos(robot_theta)
 
-            if local_x < -100:
+            # 360° 全向感知：只过滤紧贴车身 10mm 以内的点（避免雷达看到自身结构）
+            if local_x < -10:
                 continue
 
             self._local_obstacles.append((local_x, local_y, dist))
@@ -539,99 +547,122 @@ class Navigator:
         return 100.0
 
     # ============================================================
-    # 动态窗口避障（修复狭窄通道振荡问题）
+    # 动态窗口避障（基于代价评估的简化 DWA）
     # ============================================================
     def _dynamic_window_avoidance(self, x, y, theta, base_vx, base_vy, base_vw) -> Tuple[float, float, float]:
         self._update_local_costmap(x, y, theta)
 
+        # ---- 1. 360° 障碍物感知 ----
         front_obstacles = []
         left_obstacles = []
         right_obstacles = []
+        rear_left_obstacles = []
+        rear_right_obstacles = []
+        rear_obstacles = []
 
         for lx, ly, dist in self._local_obstacles:
-            angle = math.atan2(ly, lx)
-            if abs(angle) < math.radians(20) and dist < 600:
-                front_obstacles.append((lx, ly, dist))
-            elif math.radians(20) <= angle < math.radians(60) and dist < 500:
-                left_obstacles.append((lx, ly, dist))
-            elif math.radians(-60) < angle <= math.radians(-20) and dist < 500:
-                right_obstacles.append((lx, ly, dist))
+            angle_deg = math.degrees(math.atan2(ly, lx))
+            if abs(angle_deg) < 30 and dist < 800:
+                front_obstacles.append(dist)
+            elif 30 <= angle_deg < 110:
+                left_obstacles.append(dist)
+            elif -110 < angle_deg <= -30:
+                right_obstacles.append(dist)
+            elif 110 <= angle_deg < 160 and dist < 800:
+                rear_left_obstacles.append(dist)
+            elif -160 < angle_deg <= -110 and dist < 800:
+                rear_right_obstacles.append(dist)
+            elif abs(angle_deg) >= 160 and dist < 600:
+                rear_obstacles.append(dist)
 
-        front_min = min((d for _, _, d in front_obstacles), default=float('inf'))
-        left_min = min((d for _, _, d in left_obstacles), default=float('inf'))
-        right_min = min((d for _, _, d in right_obstacles), default=float('inf'))
+        front_min = min(front_obstacles, default=float('inf'))
+        left_min = min(left_obstacles, default=float('inf'))
+        right_min = min(right_obstacles, default=float('inf'))
+        rear_left_min = min(rear_left_obstacles, default=float('inf'))
+        rear_right_min = min(rear_right_obstacles, default=float('inf'))
+        rear_min = min(rear_obstacles, default=float('inf'))
 
-        vx, vy, vw = base_vx, base_vy, base_vw
+        UC = self._uniform_clearance
 
-        path_dir = self._get_path_direction(x, y, theta)
-        if path_dir is None:
-            path_dir = 0.0
+        # ---- 2. 简化 DWA：速度空间采样 + 代价评估 ----
+        # 和 A* 一样，我们评估多个候选的"代价"，选代价最低的
+        candidates = [
+            (base_vx, base_vy),                    # 0: Pure Pursuit 原始速度
+            (base_vx * 0.6, base_vy - 40),         # 1: 柔和右偏
+            (base_vx * 0.6, base_vy + 40),         # 2: 柔和左偏
+            (base_vx * 0.3, base_vy - 80),         # 3: 中等右偏
+            (base_vx * 0.3, base_vy + 80),         # 4: 中等左偏
+            (base_vx * 0.1, base_vy - 120),        # 5: 大力右偏
+            (base_vx * 0.1, base_vy + 120),        # 6: 大力左偏
+            (base_vx * 0.2, base_vy),              # 7: 纯减速
+            (-50, 0),                               # 8: 后退
+            (0, 0),                                # 9: 停止
+        ]
 
-        # 计算路径建议的侧向趋势（正=左，负=右）
-        path_lateral = math.sin(path_dir)
+        best_score = -float('inf')
+        best_vx, best_vy = base_vx, base_vy
 
-        # 计算通道宽度，用于抑制狭窄通道中的过度 lateral 振荡
-        channel_width = float('inf')
-        if left_min < float('inf') and right_min < float('inf'):
-            channel_width = left_min + right_min
+        for cvx, cvy in candidates:
+            score = 0.0
 
-        # 紧急避障：前方极近 -> 停止前进，优先侧向滑出，不要冲进去
-        if front_min < self._dw_critical_distance:
-            print(f"[DW] 极近！前方{front_min:.0f}mm，停止前进，侧向避让")
-            vx = 0.0  # 停止前进，避免冲进 EMERGENCY 触发后退振荡
-            # 优先遵循全局路径方向，同时检查该侧是否有足够空间
-            if path_lateral > 0.3 and left_min > 250:
-                vy = base_vy + 60.0   # 路径偏左，且左侧有空间
-            elif path_lateral < -0.3 and right_min > 250:
-                vy = base_vy - 60.0  # 路径偏右，且右侧有空间
-            elif right_min > left_min + 150 and right_min > 250:
-                vy = base_vy - 40.0  # 右侧空间明显更大
-            elif left_min > right_min + 150 and left_min > 250:
-                vy = base_vy + 40.0   # 左侧空间明显更大
-            else:
-                vy = base_vy * 0.5  # 不确定时保持原侧向趋势但减速
-            vw = 0.0
+            # (1) 前进奖励：鼓励向前运动
+            score += cvx * 1.0
 
-        # 减速避障
-        elif front_min < self._dw_safe_distance:
-            scale = max(0.2, (front_min - self._dw_critical_distance) /
-                       (self._dw_safe_distance - self._dw_critical_distance))
-            vx = base_vx * scale
+            # (2) 偏离 Pure Pursuit 的惩罚（保持跟随绿色全局路径）
+            score -= abs(cvx - base_vx) * 1.5
+            score -= abs(cvy - base_vy) * 1.2
 
-            # 根据通道宽度限制 lateral_delta，避免在窄道中左右剧烈摇摆
-            lateral_delta = self._dw_lateral_gain * (self._dw_safe_distance - front_min) * 0.3
-            if channel_width < 1200:
-                # 通道越窄，lateral 避让越弱，优先相信全局路径
-                channel_factor = max(0.15, channel_width / 1200.0)
-                lateral_delta *= channel_factor
+            # (3) 代价地图惩罚（和 A* 的 occ_penalty 一样！）
+            # 预测 1.0s 后的位置，查询 local_costmap（足够时间减速避障）
+            lookahead_time = 1.0
+            fx = cvx * lookahead_time
+            fy = cvy * lookahead_time
+            cost = self._get_local_cost(fx, fy)
+            score -= cost * 3.0
 
-            # 侧向修正限制：避免单次大幅横跳导致 oscillation
-            max_lateral_cmd = 40.0 if channel_width < 1000 else 70.0
+            # (4) 前方近距离障碍物惩罚（增强版，500mm 内就开始扣分）
+            if front_min < 500:
+                score -= (500 - front_min) * 0.5
+            elif front_min < 800:
+                score -= (800 - front_min) * 0.1
 
-            if right_min > left_min + 80 and right_min > 300:
-                # 右侧空间更大，倾向向右，但用 path_bias 修正
-                path_bias = math.sin(path_dir) * 40  # 路径偏左时(>0) 减少向右趋势
-                vy = base_vy - min(lateral_delta, max_lateral_cmd) + path_bias
-                print(f"[DW] 前方{front_min:.0f}mm，减速+向右避让 vy={vy:.0f} path_bias={path_bias:.0f}")
-            elif left_min > right_min + 80 and left_min > 300:
-                # 左侧空间更大，倾向向左，但用 path_bias 修正
-                path_bias = math.sin(path_dir) * 40  # 路径偏右时(<0) 减少向左趋势
-                vy = base_vy + min(lateral_delta, max_lateral_cmd) + path_bias
-                print(f"[DW] 前方{front_min:.0f}mm，减速+向左避让 vy={vy:.0f} path_bias={path_bias:.0f}")
-            else:
-                # 两侧都近，大幅减速，优先回归路径
-                vx = base_vx * 0.2
-                vy = base_vy + path_lateral * 60
-                print(f"[DW] 前方{front_min:.0f}mm，两侧狭窄，沿路径侧向回归 vy={vy:.0f}")
+            # (5) 侧向移动时检查目标侧是否有足够空间
+            if cvy > 30 and left_min < 400:
+                score -= (400 - left_min) * 0.5
+            if cvy < -30 and right_min < 400:
+                score -= (400 - right_min) * 0.5
 
-        else:
-            # 前方安全，但两侧有障碍时微调保持居中
-            if left_min < 400 and right_min > 500:
-                vy = base_vy - 15.0  # 离左侧太近，稍微右移
-            elif right_min < 400 and left_min > 500:
-                vy = base_vy + 15.0  # 离右侧太近，稍微左移
+            if score > best_score:
+                best_score = score
+                best_vx, best_vy = cvx, cvy
 
-        vx = max(0.0, min(self.MAX_VX, vx))
+        vx, vy, vw = best_vx, best_vy, base_vw
+
+        # ---- 3. 硬边界限制（安全兜底） ----
+        side_safety = 180
+        if vy > 20:
+            limit = min(left_min, rear_left_min) if rear_left_min < float('inf') else left_min
+            max_vy = max(20.0, limit - side_safety)
+            if vy > max_vy:
+                vy = max_vy
+        elif vy < -20:
+            limit = min(right_min, rear_right_min) if rear_right_min < float('inf') else right_min
+            max_vy = max(20.0, limit - side_safety)
+            if abs(vy) > max_vy:
+                vy = -max_vy
+
+        if rear_left_min < UC or rear_right_min < UC:
+            vw = vw * 0.2
+
+        if vx < -20 and (rear_min < UC or rear_left_min < UC or rear_right_min < UC):
+            vx = 0.0
+
+        # ---- 4. 日志 ----
+        if abs(vx - base_vx) > 10 or abs(vy - base_vy) > 10:
+            print(f"[DWA] 选择速度 vx={vx:.0f} vy={vy:.0f} (原始={base_vx:.0f},{base_vy:.0f}) "
+                  f"前={front_min:.0f} 左={left_min:.0f} 右={right_min:.0f} 评分={best_score:.0f}")
+
+        vx = max(-self.MAX_VX * 0.5, min(self.MAX_VX, vx))
         vy = max(-self.MAX_VY, min(self.MAX_VY, vy))
         vw = max(-self.MAX_VW, min(self.MAX_VW, vw))
 
@@ -711,7 +742,6 @@ class Navigator:
         # 横向偏差过大 -> 重规划
         lateral_error = self._calc_lateral_error(x, y, theta)
         if lateral_error > 400.0 and now - self.last_replan_time > 5.0:
-            print(f"[NAV] 横向偏差 {lateral_error:.0f}mm 持续过大，触发重规划")
             self._unfreeze_planning_map()
             if self.waypoints:
                 if self.set_target(self.waypoints[-1][0], self.waypoints[-1][1], self.target_theta):
@@ -739,11 +769,13 @@ class Navigator:
         self.state = "FOLLOWING"
         base_vx, base_vy, base_vw = self._pure_pursuit_step(x, y, theta)
 
-        # 安全减速（基于实时点云）
-        if front_dist < 800.0:
-            speed_scale = max(0.15, (front_dist - 300.0) / 500.0)
+        # 前方障碍物距离越近减速越强：500mm 开始减速，150mm 降到最低
+        if front_dist < 500.0:
+            speed_scale = max(0.15, (front_dist - 150.0) / 350.0)
             base_vx = base_vx * speed_scale
             base_vy = base_vy * speed_scale
+            if front_dist < 250.0:
+                print(f"[BRAKE] 前方障碍物 {front_dist:.0f}mm，速度缩放至 {speed_scale:.2f}")
 
         if self._dw_enabled and not is_start_phase and obstacle_level != "CLEAR":
             vx, vy, vw = self._dynamic_window_avoidance(x, y, theta, base_vx, base_vy, base_vw)
@@ -780,6 +812,7 @@ class Navigator:
             if dist > 2000 or dist < 100:
                 continue
             angle = self._normalize_angle(math.atan2(dy, dx) - theta)
+            # 扩大到 ±30°，确保能检测到正前方障碍物
             if abs(angle) < math.radians(30):
                 front_min = min(front_min, dist)
         return front_min
@@ -799,7 +832,8 @@ class Navigator:
             return False
 
         self.path = raw_path
-        self.waypoints = self._smooth_path(raw_path)
+        inflated = self._get_planning_inflated_grid()
+        self.waypoints = self._smooth_path(raw_path, inflated)
         self.current_wp = 0
 
         self.state = "FOLLOWING"
@@ -1032,9 +1066,10 @@ class Navigator:
                     continue
                 angle = self._normalize_angle(math.atan2(dy, dx) - theta)
                 a_deg = math.degrees(angle)
-                if 30 <= a_deg < 90:
+                # 扩大检测角度到 10°~90°，让车头能感知正前方两侧的障碍物
+                if 10 <= a_deg < 90:
                     left_wall = min(left_wall, d)
-                elif -90 < a_deg <= -30:
+                elif -90 < a_deg <= -10:
                     right_wall = min(right_wall, d)
             if left_wall < float('inf') and right_wall < float('inf'):
                 channel_width = left_wall + right_wall
@@ -1063,21 +1098,22 @@ class Navigator:
 
         # 增强的路径回归约束（在狭窄通道中权重更高）
         path_lateral_err, path_proj = self._calc_path_projection(x, y)
-        regress_gain = 3.0 if channel_width < 900 else 2.5
+        # 窄道中回归太激进会导致撞墙，降低增益；轻微蹭墙时进一步降低
+        regress_gain = 1.5 if channel_width < 900 else 2.0
         if abs(path_lateral_err) > 10.0 and len(self.waypoints) > 2:
             reg_dx = path_proj[0] - x
             reg_dy = path_proj[1] - y
             reg_dist = math.hypot(reg_dx, reg_dy)
             if reg_dist > 5:
                 vy_correction = -path_lateral_err * regress_gain
-                vy_correction = max(-self.MAX_VY, min(self.MAX_VY, vy_correction))
+                # 窄道中限制侧向修正幅度，避免猛打方向
+                max_vy_correction = self.MAX_VY * 0.6 if channel_width < 1000 else self.MAX_VY
+                vy_correction = max(-max_vy_correction, min(max_vy_correction, vy_correction))
                 vy += vy_correction
 
                 reg_local_x = reg_dx * cos_t + reg_dy * sin_t
                 if reg_local_x > 0:
                     vx += min(50.0, reg_local_x * 0.5)
-
-                print(f"[REGRESS] 横向偏差 {path_lateral_err:+.1f}mm，vy修正 {vy_correction:.0f} -> vy={vy:.0f}")
 
                 v_mag = math.hypot(vx, vy)
                 if v_mag > max_vx:
@@ -1111,25 +1147,31 @@ class Navigator:
         front_min = float('inf')
         left_min = float('inf')
         right_min = float('inf')
+        rear_min = float('inf')
 
         for wx, wy in world_pts:
             dx = wx - x
             dy = wy - y
             dist = math.hypot(dx, dy)
-            if dist > 1000:
+            if dist > 1500:
                 continue
             angle = self._normalize_angle(math.atan2(dy, dx) - theta)
 
-            if abs(angle) < math.radians(25):
+            # 360° 全向检测：-180° 到 +180°
+            if abs(angle) < math.radians(45):
                 front_min = min(front_min, dist)
-            elif math.radians(25) <= angle < math.radians(70):
+            elif math.radians(45) <= angle < math.radians(135):
                 left_min = min(left_min, dist)
-            elif math.radians(-70) < angle <= math.radians(-25):
+            elif math.radians(-135) < angle <= math.radians(-45):
                 right_min = min(right_min, dist)
+            else:
+                # ±135° ~ ±180° 为正后方
+                rear_min = min(rear_min, dist)
 
-        if front_min < 250:
+        # 四周统一：200mm 紧急（立即避障），400mm 内就进入 CAUTION 准备避让
+        if front_min < 200:
             return "EMERGENCY"
-        if front_min < 450 or left_min < 350 or right_min < 350:
+        if front_min < 400 or left_min < 400 or right_min < 400 or rear_min < 400:
             return "CAUTION"
 
         return "CLEAR"
@@ -1171,12 +1213,11 @@ class Navigator:
             elif -110 < angle_deg <= -60:
                 right_min = min(right_min, dist)
 
-        # 如果前方还有足够空间，不需要紧急接管，回到路径跟踪
-        if front_min > 500 and fleft_min > 400 and fright_min > 400:
+        # 如果前方还有足够空间（600mm+），不需要紧急接管，回到路径跟踪
+        if front_min > 600 and fleft_min > 500 and fright_min > 500:
             base_vx, base_vy, base_vw = self._pure_pursuit_step(x, y, theta)
-            return base_vx * 0.4, base_vy * 0.4, base_vw * 0.4
+            return base_vx * 0.3, base_vy * 0.3, base_vw * 0.3
 
-        print(f"[EVADE] 前方{front_min:.0f}mm 左前{fleft_min:.0f}mm 右前{fright_min:.0f}mm，路径方向={math.degrees(path_dir):.0f}°")
 
         # 基于路径方向搜索最优安全方向
         best_dir = None
@@ -1194,9 +1235,9 @@ class Navigator:
                 test_dirs.append(self._normalize_angle(path_dir + math.radians(priority_offset)))
 
         # 检查前方多个距离点，近距离即可，不要要求700mm都clear（窄通道做不到）
-        check_dists = [200, 400]
-        # 安全半径略放宽，因为全局路径已经做过膨胀了
-        safe_radius = max(120.0, self.total_inflation_mm * 0.85)
+        check_dists = [150, 300, 500]
+        # 安全半径必须覆盖机器人半径 + 余量，宁可保守也不要撞
+        safe_radius = max(180.0, self.total_inflation_mm * 1.2)
 
         for test_rad in test_dirs:
             safe = True
@@ -1234,13 +1275,13 @@ class Navigator:
                 best_dir = test_rad
 
         if best_dir is not None:
-            # 根据前方距离决定速度
+            # 根据前方距离决定速度，窄道中侧向滑出要更快才有效果
             if front_min < 300:
-                speed = 40.0
-            elif front_min < 500:
-                speed = 60.0
-            else:
                 speed = 80.0
+            elif front_min < 500:
+                speed = 150.0
+            else:
+                speed = 120.0
 
             vx = speed * math.cos(best_dir)
             vy = speed * math.sin(best_dir)
@@ -1392,12 +1433,8 @@ class Navigator:
             gx, gy = free_gx, free_gy
             print(f"[A*] 修正终点到: ({gx}, {gy})")
 
-        clear_r = self.obstacle_margin + 2
-        for dx in range(-clear_r, clear_r + 1):
-            for dy in range(-clear_r, clear_r + 1):
-                nx, ny = sx + dx, sy + dy
-                if in_bounds(nx, ny):
-                    inflated[ny, nx] = False
+        # 不再大面积清空起点周围，避免A*路径贴着被抹掉的墙壁走。
+        # _get_planning_inflated_grid 已保证起点中心可通行，足够A*起步。
 
         g_score = np.full((size, size), np.inf)
         f_score = np.full((size, size), np.inf)
@@ -1441,15 +1478,15 @@ class Navigator:
                     continue
 
                 occ_penalty = 0.0
-                for ox in range(-3, 4):
-                    for oy in range(-3, 4):
+                for ox in range(-8, 9):
+                    for oy in range(-8, 9):
                         if in_bounds(nx + ox, ny + oy):
                             if inflated[ny + oy, nx + ox]:
                                 dist = math.hypot(ox, oy)
                                 if dist < 0.01:
-                                    penalty = 2.0
+                                    penalty = 6.0
                                 else:
-                                    penalty = 1.0 / (dist + 0.5)
+                                    penalty = 3.5 / (dist + 0.5)
                                 occ_penalty += penalty
 
                 tentative = g_score[cy, cx] + cost + occ_penalty
@@ -1479,25 +1516,44 @@ class Navigator:
                     q.append((nx, ny))
         return None, None
 
-    def _smooth_path(self, path: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    def _smooth_path(self, path: List[Tuple[float, float]], inflated_grid=None) -> List[Tuple[float, float]]:
         if len(path) <= 2:
             return path
 
+        # 获取膨胀地图用于碰撞检查（平滑后路径不能侵入膨胀区域）
+        if inflated_grid is None:
+            inflated_grid = self._get_planning_inflated_grid()
+        grid = self.mapper.map
+
         sampled = [path[0]]
         for p in path[1:-1]:
-            if math.hypot(p[0] - sampled[-1][0], p[1] - sampled[-1][1]) > 120:
+            if math.hypot(p[0] - sampled[-1][0], p[1] - sampled[-1][1]) > 80:
                 sampled.append(p)
         sampled.append(path[-1])
 
         smooth = [list(p) for p in sampled]
-        for _ in range(5):
+        # 降低平滑权重，避免过度切角导致路径缩进障碍物
+        for _ in range(10):
             for i in range(1, len(smooth) - 1):
                 ax = (smooth[i-1][0] + smooth[i+1][0]) * 0.5
                 ay = (smooth[i-1][1] + smooth[i+1][1]) * 0.5
-                smooth[i][0] = 0.7 * smooth[i][0] + 0.3 * ax
-                smooth[i][1] = 0.7 * smooth[i][1] + 0.3 * ay
+                smooth[i][0] = 0.8 * smooth[i][0] + 0.2 * ax
+                smooth[i][1] = 0.8 * smooth[i][1] + 0.2 * ay
 
-        return [(p[0], p[1]) for p in smooth]
+        # 关键修复：平滑后检查每个点是否在膨胀栅格上，如果是则回退到原始路径点
+        restored = []
+        for i, p in enumerate(smooth):
+            mx, my = grid.world_to_map(p[0], p[1])
+            if 0 <= mx < grid.size and 0 <= my < grid.size:
+                if inflated_grid[my, mx]:
+                    # 平滑后这个点撞膨胀区了，回退到原始采样点
+                    orig = sampled[i]
+                    restored.append((orig[0], orig[1]))
+                    print(f"[SMOOTH] 路径点 {i} 平滑后侵入膨胀区，已回退到原始点")
+                    continue
+            restored.append((p[0], p[1]))
+
+        return restored
 
     def _adaptive_lookahead(self) -> float:
         if self.current_wp >= len(self.waypoints) - 1:

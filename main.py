@@ -1,3 +1,6 @@
+
+
+
 """Main: 静态地图导航 + 速度闭环控制下发 - 最终修复版（适配机器人半径230mm）"""
 
 import sys
@@ -126,20 +129,20 @@ class MainWindow(QMainWindow):
 
         right_layout.addStretch()
 
-        # self.btn_save = QPushButton("保存地图")
-        # self.btn_save.setStyleSheet("font-size: 14px; padding: 10px;")
-        # self.btn_save.clicked.connect(self.save_map)
-        # right_layout.addWidget(self.btn_save)
-        #
-        # self.btn_clear = QPushButton("清空地图")
-        # self.btn_clear.setStyleSheet("font-size: 14px; padding: 10px;")
-        # self.btn_clear.clicked.connect(self.clear_map)
-        # right_layout.addWidget(self.btn_clear)
-        #
-        # self.btn_reset_odom = QPushButton("重置里程计")
-        # self.btn_reset_odom.setStyleSheet("font-size: 14px; padding: 10px;")
-        # self.btn_reset_odom.clicked.connect(self.reset_odom)
-        # right_layout.addWidget(self.btn_reset_odom)
+        self.btn_save = QPushButton("保存地图")
+        self.btn_save.setStyleSheet("font-size: 14px; padding: 10px;")
+        self.btn_save.clicked.connect(self.save_map)
+        right_layout.addWidget(self.btn_save)
+
+        self.btn_clear = QPushButton("清空地图")
+        self.btn_clear.setStyleSheet("font-size: 14px; padding: 10px;")
+        self.btn_clear.clicked.connect(self.clear_map)
+        right_layout.addWidget(self.btn_clear)
+
+        self.btn_reset_odom = QPushButton("重置里程计")
+        self.btn_reset_odom.setStyleSheet("font-size: 14px; padding: 10px;")
+        self.btn_reset_odom.clicked.connect(self.reset_odom)
+        right_layout.addWidget(self.btn_reset_odom)
 
         right_layout.addSpacing(20)
         nav_title = QLabel("▎目标点导航")
@@ -167,54 +170,54 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(QLabel("目标角度 (°):"))
         right_layout.addWidget(self.target_theta_deg)
 
-        # self.btn_nav = QPushButton("🚀 开始导航")
-        # self.btn_nav.setStyleSheet(
-        #     "font-size: 14px; padding: 10px; background-color: #00aa66; color: white; font-weight: bold;"
-        # )
-        # self.btn_nav.clicked.connect(self.start_navigation)
-        # right_layout.addWidget(self.btn_nav)
-        #
-        # self.btn_stop_nav = QPushButton("⏹ 停止导航")
-        # self.btn_stop_nav.setStyleSheet(
-        #     "font-size: 14px; padding: 10px; background-color: #aa3333; color: white; font-weight: bold;"
-        # )
-        # self.btn_stop_nav.clicked.connect(self.stop_navigation)
-        # right_layout.addWidget(self.btn_stop_nav)
-        #
-        # self.btn_send_ack = QPushButton("📤 手动发送完成帧")
-        # self.btn_send_ack.setStyleSheet(
-        #     "font-size: 13px; padding: 8px; background-color: #3366aa; color: white; font-weight: bold;"
-        # )
-        # self.btn_send_ack.clicked.connect(self.on_manual_send_ack)
-        # right_layout.addWidget(self.btn_send_ack)
-
-        right_layout.addSpacing(10)
-        hold_title = QLabel("▎速度持续控制 (按住发送，松开停止)")
-        hold_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffcc00;")
-        right_layout.addWidget(hold_title)
-
-        self.vx_input = QLineEdit("100")
-        self.vy_input = QLineEdit("100")
-        self.vw_input = QLineEdit("30")
-        for inp in (self.vx_input, self.vy_input, self.vw_input):
-            inp.setStyleSheet(
-                "font-size: 12px; padding: 5px; background-color: #2a2a2a; color: #fff; border: 1px solid #555;"
-            )
-
-        self.btn_hold_all = QPushButton("🚀 长按发送速度")
-        self.btn_hold_all.setStyleSheet(
-            "font-size: 14px; padding: 10px; background-color: #ff8800; color: white; font-weight: bold;"
+        self.btn_nav = QPushButton("🚀 开始导航")
+        self.btn_nav.setStyleSheet(
+            "font-size: 14px; padding: 10px; background-color: #00aa66; color: white; font-weight: bold;"
         )
-        self.btn_hold_all.pressed.connect(self.on_hold_pressed)
-        self.btn_hold_all.released.connect(self.on_hold_released)
+        self.btn_nav.clicked.connect(self.start_navigation)
+        right_layout.addWidget(self.btn_nav)
 
-        right_layout.addWidget(QLabel("vx 速度 (mm/s):"))
-        right_layout.addWidget(self.vx_input)
-        right_layout.addWidget(QLabel("vy 速度 (mm/s):"))
-        right_layout.addWidget(self.vy_input)
-        right_layout.addWidget(QLabel("vw 速度 (°/s):"))
-        right_layout.addWidget(self.vw_input)
-        right_layout.addWidget(self.btn_hold_all)
+        self.btn_stop_nav = QPushButton("⏹ 停止导航")
+        self.btn_stop_nav.setStyleSheet(
+            "font-size: 14px; padding: 10px; background-color: #aa3333; color: white; font-weight: bold;"
+        )
+        self.btn_stop_nav.clicked.connect(self.stop_navigation)
+        right_layout.addWidget(self.btn_stop_nav)
+
+        self.btn_send_ack = QPushButton("📤 手动发送完成帧")
+        self.btn_send_ack.setStyleSheet(
+            "font-size: 13px; padding: 8px; background-color: #3366aa; color: white; font-weight: bold;"
+        )
+        self.btn_send_ack.clicked.connect(self.on_manual_send_ack)
+        right_layout.addWidget(self.btn_send_ack)
+
+        # right_layout.addSpacing(10)
+        # hold_title = QLabel("▎速度持续控制 (按住发送，松开停止)")
+        # hold_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffcc00;")
+        # right_layout.addWidget(hold_title)
+        #
+        # self.vx_input = QLineEdit("100")
+        # self.vy_input = QLineEdit("100")
+        # self.vw_input = QLineEdit("30")
+        # for inp in (self.vx_input, self.vy_input, self.vw_input):
+        #     inp.setStyleSheet(
+        #         "font-size: 12px; padding: 5px; background-color: #2a2a2a; color: #fff; border: 1px solid #555;"
+        #     )
+        #
+        # self.btn_hold_all = QPushButton("🚀 长按发送速度")
+        # self.btn_hold_all.setStyleSheet(
+        #     "font-size: 14px; padding: 10px; background-color: #ff8800; color: white; font-weight: bold;"
+        # )
+        # self.btn_hold_all.pressed.connect(self.on_hold_pressed)
+        # self.btn_hold_all.released.connect(self.on_hold_released)
+        #
+        # right_layout.addWidget(QLabel("vx 速度 (mm/s):"))
+        # right_layout.addWidget(self.vx_input)
+        # right_layout.addWidget(QLabel("vy 速度 (mm/s):"))
+        # right_layout.addWidget(self.vy_input)
+        # right_layout.addWidget(QLabel("vw 速度 (°/s):"))
+        # right_layout.addWidget(self.vw_input)
+        # right_layout.addWidget(self.btn_hold_all)
 
         self.nav_status = QLabel("导航: 空闲")
         self.nav_status.setStyleSheet("font-size: 13px; color: #00ffaa;")

@@ -115,7 +115,7 @@ class OccupancyGridMap:
     def update_ray(self, robot_x: float, robot_y: float,
                    point_x: float, point_y: float):
         dist = math.hypot(point_x - robot_x, point_y - robot_y)
-        if dist < 150:
+        if dist < 100:
             return
         if dist > 5000:
             return
