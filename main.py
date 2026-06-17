@@ -246,7 +246,7 @@ class MainWindow(QMainWindow):
         self._last_cmd_time = 0.0
         self._nav_was_active = False
 
-        self._obstacle_fusion_interval = 0.3    # 加快障碍物融合（原来0.5s → 0.3s）
+        self._obstacle_fusion_interval = 0.5
         self._last_obstacle_fusion = 0.0
 
         self._hold_axes = {"vx": 0.0, "vy": 0.0, "vw": 0.0}
@@ -566,7 +566,7 @@ class MainWindow(QMainWindow):
         self._last_vw = 0.0
         self._last_cmd_time = 0.0
         self._nav_was_active = False
-        self._obstacle_fusion_interval = 0.3
+        self._obstacle_fusion_interval = 0.5
         self._last_obstacle_fusion = 0.0
         self._alignment_ack_done = False
         self._need_replan = False
