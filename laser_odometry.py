@@ -122,9 +122,19 @@ class LaserOdometry:
         self.last_wheel_theta = odom_theta
 
     def update(self, local_points: List[Tuple[float, float]],
-               timestamp: float = 0.0) -> Tuple[bool, float, float, float]:
+               timestamp: float = 0.0,
+               dx_wheel: float = 0.0,
+               dy_wheel: float = 0.0,
+               dtheta_wheel: float = 0.0) -> Tuple[bool, float, float, float]:
         """
         粒子滤波更新一帧
+
+        Args:
+            local_points: 当前帧的激光点云（局部坐标）
+            timestamp: 时间戳
+            dx_wheel: 轮式里程计 x 增量（mm），由外部计算传入
+            dy_wheel: 轮式里程计 y 增量（mm）
+            dtheta_wheel: 轮式里程计角度增量（rad）
 
         Returns:
             success, x, y, theta
@@ -137,23 +147,7 @@ class LaserOdometry:
 
         self.frame_count += 1
 
-        # 1. 运动模型：根据轮式里程计增量传播所有粒子
-        if self.wheel_initialized:
-            # 计算轮式里程计增量（从上次 update 到现在）
-            # 注意：这里用绝对值差近似，实际应该用上一次 update 时的轮式读数
-            # 简化处理：假设轮式里程计是连续的，用当前读数作为中心
-            dx_wheel = 0.0  # 增量由外部在 main.py 中计算
-            dy_wheel = 0.0
-            dtheta_wheel = 0.0
-        else:
-            dx_wheel = dy_wheel = dtheta_wheel = 0.0
-
-        # 静止检测：根据轮式速度判断
-        # 这里简化：如果轮式里程计读数变化很小，认为是静止
-        # 实际应该在 main.py 中传入速度或增量
-        # 这里用粒子散布程度来判断
-
-        # 2. 运动传播（加噪声）
+        # 1. 运动传播（加噪声）—— 使用外部传入的真实增量，只执行一次
         self._motion_update(dx_wheel, dy_wheel, dtheta_wheel)
 
         # 3. 观测更新：根据点云匹配地图给粒子打分

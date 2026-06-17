@@ -32,7 +32,7 @@ MQTT_USER = "esp_send"
 MQTT_PASS = "00000000"
 TOPIC_LIDAR = "esp/f79541/data"
 TOPIC_CONTROL = "device/f79541/data"
-TOPIC_OPENMV  = "openmv/nav"
+TOPIC_OPENMV  = "DEevi/openmv/nav"
 
 MAP_SIZE_MM = 8000
 RESOLUTION_MM = 15
@@ -334,19 +334,19 @@ class MainWindow(QMainWindow):
         checksum = sum(frame[2:]) & 0xFF
         frame.append(checksum)
         frame.append(0xBB)
-
-        try:
-            self.client.publish(TOPIC_CONTROL, bytes(frame), qos=1)
-            hex_str = ' '.join(f'{b:02X}' for b in frame)
-            print(f"[CMD] 导航完成校验帧已发送(ESP32) | HEX[{hex_str}]")
-        except Exception as e:
-            print(f"[CMD] 发送失败: {e}")
-
-        try:
-            self.client.publish(TOPIC_OPENMV, "1", qos=1)
-            print(f"[CMD] 角度对准标志位已发送(OpenMV) -> {TOPIC_OPENMV}")
-        except Exception as e:
-            print(f"[CMD] OpenMV发送失败: {e}")
+        #
+        # try:
+        #     self.client.publish(TOPIC_CONTROL, bytes(frame), qos=1)
+        #     hex_str = ' '.join(f'{b:02X}' for b in frame)
+        #     print(f"[CMD] 导航完成校验帧已发送(ESP32) | HEX[{hex_str}]")
+        # except Exception as e:
+        #     print(f"[CMD] 发送失败: {e}")
+        #
+        # try:
+        #     self.client.publish(TOPIC_OPENMV, "1", qos=1)
+        #     print(f"[CMD] 角度对准标志位已发送(OpenMV) -> {TOPIC_OPENMV}")
+        # except Exception as e:
+        #     print(f"[CMD] OpenMV发送失败: {e}")
 
         self._alignment_ack_done = True
 
@@ -690,11 +690,14 @@ def processing_thread(frame_queue: Queue, mapper: LidarMapper, comm: Communicate
                     window._last_wheel_theta = odom.theta
 
                     window.laser_odom.update_wheel_odom(odom.x, odom.y, odom.theta)
-                    window.laser_odom._motion_update(dx_wheel, dy_wheel, dtheta_wheel)
 
+                # 将真实里程计增量传入 update()，避免双重加噪
                 success, lx, ly, ltheta = window.laser_odom.update(
                     local_pts,
-                    timestamp=current_time
+                    timestamp=current_time,
+                    dx_wheel=dx_wheel if odom.valid else 0.0,
+                    dy_wheel=dy_wheel if odom.valid else 0.0,
+                    dtheta_wheel=dtheta_wheel if odom.valid else 0.0
                 )
 
                 if success:
