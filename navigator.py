@@ -36,13 +36,13 @@ class Navigator:
         self.obstacle_margin =6
         self.replan_threshold = 200.0
 
-        self.replan_interval = 1.0
+        self.replan_interval = 2.0               # 全局重规划间隔（类似 move_base planner_frequency）
         self.last_replan_time = 0.0
-        self.dynamic_obstacle_dist = 500.0
+        self.dynamic_obstacle_dist = 600.0       # 增加障碍物感知距离
         self.dynamic_obstacle_angle = math.radians(45)
 
-        self.safety_distance = 800.0
-        self.obstacle_sector = math.radians(45)
+        self.safety_distance = 1000.0              # 增加安全感知距离
+        self.obstacle_sector = math.radians(60)   # 扩大前方感知扇区
 
         self.stuck_timer = 0.0
         self.last_pos = None
@@ -86,12 +86,11 @@ class Navigator:
         self._local_costmap_center = (0, 0)
         self._local_costmap_valid = False
 
-        # 动态窗口避障参数
+        # 动态窗口避障参数（参考 src DWA 参数调整）
         self._dw_enabled = True
-        # 四周统一安全距离：车头/车尾/侧方都使用同样的阈值
-        self._uniform_clearance = 250.0   # 四周统一安全余量 mm
-        self._dw_safe_distance = 180.0    # 前方 150mm 开始减速（给 120mm 留缓冲）
-        self._dw_critical_distance = 140.0  # 前方 120mm 停止
+        self._uniform_clearance = 330.0            # 四周统一安全余量 = 半对角线 + safety_margin
+        self._dw_safe_distance = 500.0             # 前方 500mm 开始减速
+        self._dw_critical_distance = 250.0         # 前方 250mm 紧急停止
         self._dw_lateral_gain = 1.5
 
         # 卡住检测参数（长时间卡住才重规划）
@@ -498,8 +497,9 @@ class Navigator:
             local_x = dx * math.cos(robot_theta) + dy * math.sin(robot_theta)
             local_y = -dx * math.sin(robot_theta) + dy * math.cos(robot_theta)
 
-            # 360° 全向感知：只过滤紧贴车身 10mm 以内的点（避免雷达看到自身结构）
-            if local_x < -10:
+            # ★ 360° 全向感知：不滤除任何方向的障碍物点（参考 src costmap 全局感知）
+            # 只过滤紧贴车身的点（< 80mm，避免雷达看到自身结构）
+            if dist < 80:
                 continue
 
             self._local_obstacles.append((local_x, local_y, dist))
@@ -545,9 +545,10 @@ class Navigator:
 
         # ---- 1. 动态窗口：根据当前速度和加速度限制计算可达速度范围 ----
         dt = 0.1  # 控制周期 100ms
-        max_ax = 400.0  # mm/s^2
-        max_ay = 400.0
-        max_aw = 2.0   # rad/s^2 角加速度
+        # 参考 src DWA: acc_lim_x=3m/s²=3000mm/s², acc_lim_theta=3rad/s²
+        max_ax = 500.0   # mm/s^2（提高加速度限制以适应急停）
+        max_ay = 500.0
+        max_aw = 3.0     # rad/s^2（提高角加速度用于快速转向避障）
 
         # 速度约束窗口 [vx_min, vx_max, vy_min, vy_max, vw_min, vw_max]
         vs = [
@@ -564,22 +565,23 @@ class Navigator:
         tight_space = len(near_obstacles) > 10
         very_tight = len([d for _, _, d in self._local_obstacles if d < 350]) > 5
 
-        # ---- 2. 速度空间离散采样 ----
+        # ---- 2. 速度空间离散采样（参考 src vx_samples=10, vth_samples=20）----
         if emergency or very_tight:
-            vx_samples = np.linspace(vs[0], min(vs[1], 60.0), 7)
+            vx_samples = np.linspace(vs[0], min(vs[1], 50.0), 6)
             vy_samples = np.linspace(vs[2], vs[3], 7)
             vw_samples = np.linspace(vs[4], vs[5], 5)
             predict_time = 0.4
             time_step = 0.05
         elif tight_space:
-            vx_samples = np.linspace(vs[0], min(vs[1], 80.0), 5)
-            vy_samples = np.linspace(vs[2], vs[3], 5)
-            vw_samples = np.linspace(vs[4], vs[5], 3)
+            vx_samples = np.linspace(vs[0], min(vs[1], 70.0), 5)
+            vy_samples = np.linspace(vs[2], vs[3], 6)
+            vw_samples = np.linspace(vs[4], vs[5], 4)
             predict_time = 0.5
             time_step = 0.1
         else:
-            vx_samples = np.linspace(vs[0], vs[1], 7)
-            vy_samples = np.linspace(vs[2], vs[3], 7)
+            # ★ 始终包含 vx=0（停止）作为安全候选
+            vx_samples = np.linspace(vs[0], vs[1], 8)
+            vy_samples = np.linspace(vs[2], vs[3], 9)
             vw_samples = np.linspace(vs[4], vs[5], 5)
             predict_time = 0.8
             time_step = 0.1
@@ -770,14 +772,14 @@ class Navigator:
         if self.state in ("IDLE", "FAILED", "DONE"):
             return 0.0, 0.0, 0.0
 
-        # 起步阶段判断：基于距离+障碍物距离，而非仅基于路径点索引
-        # 如果起点附近（300mm内）或前方有密集障碍物，延长起步保护
+        # 起步阶段判断：只在前 300mm 或 0.5s 内保护，之后 DWA 立即接管
         if self.waypoints and len(self.waypoints) > 1:
             start_dist = math.hypot(x - self.waypoints[0][0], y - self.waypoints[0][1])
-            wp_based = (self.current_wp < 3) and (len(self.waypoints) > 3)
-            # 距离起点 < 500mm 且路径点数 > 2 → 仍在起步阶段
-            dist_based = start_dist < 500.0 and self.current_wp < max(3, len(self.waypoints) // 3)
-            is_start_phase = wp_based or dist_based
+            # 缩短起步保护：仅起点附近 300mm 内
+            dist_based = start_dist < 300.0
+            # 如果前方已经有障碍物，立即启用 DWA
+            has_front_obstacle = self._get_front_distance(x, y, theta) < 800.0
+            is_start_phase = dist_based and not has_front_obstacle
         else:
             is_start_phase = False
 
@@ -795,6 +797,17 @@ class Navigator:
                 return 0.0, 0.0, 0.0
 
         now = time.time()
+
+        # ===== 定期全局重规划（类似 move_base planner_frequency: 5Hz，实际间隔2s）=====
+        if (now - self.last_replan_time > self.replan_interval and
+            self._plan_frozen and self.state == "FOLLOWING"):
+            if self.waypoints and len(self.waypoints) > 1:
+                target = self.waypoints[-1]
+                self._unfreeze_planning_map()
+                if self.set_target(target[0], target[1], self.target_theta):
+                    self.last_replan_time = now
+                    print(f"[REPLAN] 定期重规划完成，路径点: {len(self.waypoints)}个")
+                    return 0.0, 0.0, 0.0
 
         # 卡住检测（长时间卡住才重规划）
         self._stuck_pos_history.append((x, y, now))
@@ -860,34 +873,31 @@ class Navigator:
         obstacle_level = self._check_obstacle_level(x, y, theta)
         front_dist = self._get_front_distance(x, y, theta)
 
-        # 障碍物附近重置卡住计时器：靠近障碍物时移动慢是正常的，不要触发后退振荡
-        if front_dist < 600.0 or obstacle_level != "CLEAR":
-            self.stuck_timer = now
-
+        # 始终更新局部代价地图（类似 src local_costmap 持续更新）
         self.state = "FOLLOWING"
         base_vx, base_vy, base_vw = self._pure_pursuit_step(x, y, theta)
 
-        # 前方障碍物距离越近减速越强：500mm 开始减速，150mm 降到最低
-        if front_dist < 500.0:
-            speed_scale = max(0.15, (front_dist - 150.0) / 350.0)
+        # 前方障碍物距离越近减速越强：600mm 开始减速，250mm 降到最低
+        if front_dist < 600.0:
+            speed_scale = max(0.15, (front_dist - 150.0) / 450.0)
             base_vx = base_vx * speed_scale
             base_vy = base_vy * speed_scale
-            if front_dist < 250.0:
+            if front_dist < 300.0:
                 print(f"[BRAKE] 前方障碍物 {front_dist:.0f}mm，速度缩放至 {speed_scale:.2f}")
 
-        # 局部规划：统一使用标准 DWA（CAUTION / EMERGENCY 都走代价评估）
-        if self._dw_enabled and not is_start_phase and obstacle_level != "CLEAR":
+        # ===== 核心改动：DWA 始终运行（类似 src controller_frequency: 10Hz）=====
+        # 不再依赖 obstacle_level 判断，DWA 每帧评估轨迹安全性
+        if self._dw_enabled and not is_start_phase:
             emergency = (obstacle_level == "EMERGENCY")
             vx, vy, vw = self._dynamic_window_avoidance(x, y, theta, base_vx, base_vy, base_vw, emergency=emergency)
             if emergency:
                 self.state = "EVADE_EMERGENCY"
-            # DWA 返回后退速度时，检查是否是过度保守
+            # DWA 返回后退速度时的安全性检查
             if vx < 0 and base_vx > 20:
-                if front_dist < 400:
-                    # 前方确实太近（<400mm），保留 DWA 的后退判断
-                    pass
+                if front_dist < 350:
+                    pass  # 前方确实太近，保留 DWA 的后退判断
                 else:
-                    # DWA 过度保守，回退到大幅降速的 pure pursuit
+                    # DWA 过度保守，回退到降速的 pure pursuit
                     vx = base_vx * 0.3
                     vy = base_vy * 0.3
                     vw = base_vw * 0.3
@@ -1282,10 +1292,12 @@ class Navigator:
                 # ±135° ~ ±180° 为正后方
                 rear_min = min(rear_min, dist)
 
-        # 四周统一：200mm 紧急（立即避障），400mm 内就进入 CAUTION 准备避让
-        if front_min < 200:
+        # 全向感知：参考 src DWA 的 costmap 范围，更早触发避障
+        # 250mm 紧急（src 中使用 footprint + inflation 的矩形碰撞检测等效范围）
+        # 600mm 开始减速和避障准备
+        if front_min < 250 or left_min < 200 or right_min < 200:
             return "EMERGENCY"
-        if front_min < 400 or left_min < 400 or right_min < 400 or rear_min < 400:
+        if front_min < 600 or left_min < 400 or right_min < 400 or rear_min < 300:
             return "CAUTION"
 
         return "CLEAR"
