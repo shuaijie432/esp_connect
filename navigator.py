@@ -1054,8 +1054,8 @@ class Navigator:
                 self._startup_align_phase = 2
                 print(f"[STARTUP] 起点保护完成 → 开始路径跟踪")
                 return 0.0, 0.0, 0.0
-            print(f"[STARTUP] 起点保护 第{frame + 1}/5 帧: 右上方 vx=250 vy=250")
-            return 350.0, -250.0, 0.0
+            print(f"[STARTUP] 起点保护 第{frame + 1}/3 帧: 右上方 vx=250 vy=250")
+            return 250.0, -150.0, 0.0
 
         # ---- 后续导航：原地旋转对准路径方向 ----
         if not self.waypoints or len(self.waypoints) < 2:

@@ -61,10 +61,15 @@ class LaserOdometry:
         self.wheel_initialized = False
 
         # 运动模型噪声（静止时 noise 小，运动时 noise 大）
-        self.motion_noise_xy_static = 2.0     # 静止时位置噪声 mm
-        self.motion_noise_theta_static = 0.01  # 静止时角度噪声 rad
+        self.motion_noise_xy_static = 0.5     # 静止时位置噪声 mm（改小）
+        self.motion_noise_theta_static = 0.005  # 静止时角度噪声 rad（改小）
         self.motion_noise_xy_dynamic = 30.0   # 运动时位置噪声 mm
         self.motion_noise_theta_dynamic = 0.15 # 运动时角度噪声 rad
+
+        # 静止判定阈值：轮式增量小于此值认为是噪声，直接忽略
+        self.stationary_dx_threshold = 2.0    # mm
+        self.stationary_dy_threshold = 2.0    # mm
+        self.stationary_dtheta_threshold = 0.02  # rad (~1.1°)
 
         # 观测模型参数
         self.hit_score = 2.0
@@ -180,6 +185,22 @@ class LaserOdometry:
 
     def _motion_update(self, dx: float, dy: float, dtheta: float):
         """运动模型：所有粒子按轮式增量传播 + 高斯噪声"""
+        # === 关键修改：增量极小时认为是静止噪声，直接忽略，从源头消除漂移 ===
+        is_input_stationary = (
+            abs(dx) < self.stationary_dx_threshold and
+            abs(dy) < self.stationary_dy_threshold and
+            abs(dtheta) < self.stationary_dtheta_threshold
+        )
+
+        if is_input_stationary:
+            # 静止时不传播任何运动增量，也不加运动噪声
+            # 粒子位置完全冻结，仅靠观测模型（激光匹配）维持定位
+            self.is_stationary = True
+            return
+        else:
+            # 增量超过阈值，明确标记为非静止
+            self.is_stationary = False
+
         # 根据静止状态选择噪声大小
         if self.is_stationary:
             noise_xy = self.motion_noise_xy_static
@@ -282,9 +303,10 @@ class LaserOdometry:
                 new_p = self.particles[idx].copy()
                 # 重采样后加少量噪声防止粒子退化
                 if self.is_stationary:
-                    new_p.x += np.random.normal(0, 2.0)
-                    new_p.y += np.random.normal(0, 2.0)
-                    new_p.theta += np.random.normal(0, 0.005)
+                    # 静止时几乎不加噪声，防止假漂移
+                    new_p.x += np.random.normal(0, 0.3)
+                    new_p.y += np.random.normal(0, 0.3)
+                    new_p.theta += np.random.normal(0, 0.001)
                 else:
                     new_p.x += np.random.normal(0, 10.0)
                     new_p.y += np.random.normal(0, 10.0)
