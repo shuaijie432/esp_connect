@@ -30,7 +30,7 @@ class Navigator:
         self.robot_width_mm = 250.0           # 27cm 车身宽度
         self.robot_length_mm = 250.0          # 27cm 车身长度
         self.robot_radius_mm = self.robot_width_mm / 2.0   # 135mm
-        self.safety_margin_mm = 150.0          # 从 30 加大到 80，给定位误差和车身凸出留足余量
+        self.safety_margin_mm = 170.0          # 从 30 加大到 80，给定位误差和车身凸出留足余量
         self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 215mm
 
         self.obstacle_margin =8
@@ -58,7 +58,7 @@ class Navigator:
 
         # 速度参数（底盘支持平移）
         self.MAX_VX = 100.0   # 从 150 降低，窄道中有更多反应时间
-        self.MAX_VY = 130.0   # 从 80 提高，底盘支持平移，侧向逃避需要更大速度
+        self.MAX_VY = 150.0   # 从 80 提高，底盘支持平移，侧向逃避需要更大速度
         self.MAX_VW = 0.5
         self.KP_V = 0.5
         self.KP_W = 1.2
@@ -97,7 +97,7 @@ class Navigator:
         self._uniform_clearance = 250.0   # 四周统一安全余量 mm
         self._dw_safe_distance = 180.0    # 前方 150mm 开始减速（给 120mm 留缓冲）
         self._dw_critical_distance = 140.0  # 前方 120mm 停止
-        self._dw_lateral_gain = 1.5
+        self._dw_lateral_gain = 1.7
 
         # 卡住检测参数（长时间卡住才重规划）
         self._stuck_check_start = 0.0
@@ -532,7 +532,7 @@ class Navigator:
             local_y = -dx * math.sin(robot_theta) + dy * math.cos(robot_theta)
 
             # 360° 全向感知：只过滤紧贴车身 10mm 以内的点
-            if local_x < -10:
+            if local_x < -200:
                 continue
 
             age = now - t
@@ -585,8 +585,8 @@ class Navigator:
         self._update_local_costmap(x, y, theta)
 
         # ---- 1. 动态窗口：根据当前速度和加速度限制计算可达速度范围 ----
-        dt = 0.1  # 控制周期 100ms
-        max_ax = 400.0  # mm/s^2
+        dt = 0.3  # 控制周期 100ms
+        max_ax = 430.0  # mm/s^2
         max_ay = 430.0
         max_aw = 2.0   # rad/s^2 角加速度
 
@@ -677,7 +677,7 @@ class Navigator:
                     )  # ≈ 230mm，即使静止也不能小于这个
                     speed_mag = math.hypot(cvx, cvy)
                     if speed_mag < 30:
-                        scale = 0.55
+                        scale = 0.7
                     elif speed_mag < 60:
                         scale = 0.7
                     elif speed_mag < 100:
@@ -739,14 +739,12 @@ class Navigator:
         if not candidates:
             if collision_candidates:
                 best_collision = max(collision_candidates, key=lambda c: c['min_clearance'])
-                if best_collision['min_clearance'] > 100:
+                if best_collision['min_clearance'] > 150:
                     cvx, cvy, cvw = best_collision['vx'], best_collision['vy'], best_collision['vw']
                     scale = 0.3
                     vx = max(0.0, cvx * scale)
                     vy = cvy * scale
                     vw = cvw * 0.3
-                    print(f"[DWA] 无可碰撞轨迹，选最小代价: vx={vx:.0f} vy={vy:.0f} "
-                          f"clearance={best_collision['min_clearance']:.0f}mm")
                     vx = max(0.0, min(self.MAX_VX, vx))
                     vy = max(-self.MAX_VY, min(self.MAX_VY, vy))
                     vw = max(-self.MAX_VW, min(self.MAX_VW, vw))
@@ -767,7 +765,7 @@ class Navigator:
         elif tight_space:
             weights = {'heading': 0.20, 'clearance': 0.35, 'velocity': 0.15, 'path': 0.15, 'smooth': 0.15}
         else:
-            weights = {'heading': 0.25, 'clearance': 0.30, 'velocity': 0.20, 'path': 0.15, 'smooth': 0.10}
+            weights = {'heading': 0.15, 'clearance': 0.30, 'velocity': 0.15, 'path': 0.15, 'smooth': 0.25}
 
         best_score = -float('inf')
         best_vx, best_vy, best_vw = base_vx, base_vy, base_vw
@@ -835,6 +833,7 @@ class Navigator:
             is_start_phase = False
 
         if self._reached_goal(x, y):
+            self._nav_count += 1  # 到达目标才算一次完整导航
             if self.target_theta is not None:
                 self.state = "ALIGNING"
                 print(f"[NAV] 到达目标位置，开始对准角度 {math.degrees(self.target_theta):.1f}°")
@@ -904,8 +903,6 @@ class Navigator:
         elif lateral_error > 300.0:
             print(f"[NAV] 横向偏差 {lateral_error:.0f}mm 较大，依赖回归修正")
 
-        if self._off_track(x, y, theta):
-            print("[NAV] 偏离航线，依赖回归修正")
 
         obstacle_level = self._check_obstacle_level(x, y, theta)
         front_dist = self._get_front_distance(x, y, theta)
@@ -1003,6 +1000,10 @@ class Navigator:
         self.waypoints = self._smooth_path(raw_path, inflated)
         self.current_wp = 0
 
+        # 重规划时跳过启动对齐（机器人已在运动中）
+        # 注意：必须在设置 self.state = "FOLLOWING" 之前检查旧状态
+        was_following = (self.state == "FOLLOWING")
+
         self.state = "FOLLOWING"
         self.last_replan_time = time.time()
         self.stuck_timer = time.time()
@@ -1016,11 +1017,9 @@ class Navigator:
         self._send_alignment_ack = False
         self._align_stable_count = 0
 
-        # 每次导航递增计数，首次=起点保护，后续=原地旋转对齐
-        self._nav_count += 1
-        # 重置启动对齐
-        self._startup_align_phase = 1
-        self._startup_align_stable = 0
+        if not was_following:
+            self._startup_align_phase = 1
+            self._startup_align_stable = 0
 
         print(f"[NAV] 目标已设置: ({x:.0f}, {y:.0f}), 路径点: {len(self.waypoints)}个, 规划已冻结")
         return True
@@ -1047,14 +1046,16 @@ class Navigator:
     # 后续导航：原地旋转，让车头大致对准路径方向后再开始跟踪。
     # ============================================================
     def _startup_alignment_step(self, x: float, y: float, theta: float) -> Tuple[float, float, float]:
-        # ---- 首次导航：起点保护，向右上方移动 3 帧 ----
-        if self._nav_count == 1:
+        # ---- 首次导航：起点保护，向右上方移动 ----
+        if self._nav_count == 0:
             frame = self._startup_align_stable
             self._startup_align_stable += 1
-            if frame >= 3:
+            if frame >= 5:
                 self._startup_align_phase = 2
+                print(f"[STARTUP] 起点保护完成 → 开始路径跟踪")
                 return 0.0, 0.0, 0.0
-            return 150.0, 150.0, 0.0
+            print(f"[STARTUP] 起点保护 第{frame + 1}/5 帧: 右上方 vx=250 vy=250")
+            return 350.0, -250.0, 0.0
 
         # ---- 后续导航：原地旋转对准路径方向 ----
         if not self.waypoints or len(self.waypoints) < 2:
