@@ -55,9 +55,12 @@ class LidarMapper:
         if load_map_path and os.path.exists(load_map_path):
             self.map.load_from_image(load_map_path)
             self.static_map_mode = True
+            # 保存原始地图备份，用于 clear_map 时恢复（而非从可能被污染的文件重载）
+            self._clean_log_odds = self.map.log_odds.copy()
             print(f"[MAPPER] 静态地图模式: 已加载 {load_map_path}")
         elif load_map_path:
             print(f"[WARN] 地图文件不存在: {load_map_path}")
+            self._clean_log_odds = None
 
         self.frame_count = 0
         self.total_points = 0
@@ -183,9 +186,10 @@ class LidarMapper:
 
     def clear_map(self):
         with self.lock:
-            if self.static_map_mode and self._load_map_path:
-                self.map.load_from_image(self._load_map_path)
-                print("[MAPPER] 地图已重置为原始静态地图")
+            if self.static_map_mode and hasattr(self, '_clean_log_odds') and self._clean_log_odds is not None:
+                # 从原始备份恢复，而非从可能被污染的文件重载
+                self.map.log_odds = self._clean_log_odds.copy()
+                print("[MAPPER] 地图已从原始备份恢复")
             else:
                 self.map.log_odds.fill(0)
 

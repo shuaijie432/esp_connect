@@ -238,6 +238,7 @@ class MainWindow(QMainWindow):
         self._alignment_ack_done = False
         self._pending_obstacles = []
         self._obstacle_processing = False
+        self._auto_nav_triggered = False
 
     def _on_obstacle_fusion(self, obstacle_candidates):
         self._pending_obstacles.extend(obstacle_candidates)
@@ -276,8 +277,14 @@ class MainWindow(QMainWindow):
             self.obstacle_label.setText(
                 f"障碍物: {permanent_count}个永久, {temp_count}个临时"
             )
-            if result.get('updated', 0) > 0 and self.navigator.is_active():
-                print(f"[MAP_FUSION] 障碍物位置变化，触发重规划")
+            # 任何障碍物变化都触发重规划：新增、位置变化、新固化为永久
+            # 但 ALIGNING（对准角度）期间不触发，避免打断角度对准
+            obstacle_changed = (result.get('updated', 0) > 0 or
+                                result.get('newly_permanent', 0) > 0 or
+                                result.get('added', 0) > 0)
+            if obstacle_changed and self.navigator.is_active() and self.navigator.state != "ALIGNING":
+                print(f"[MAP_FUSION] 障碍物变化(新增={result.get('updated',0)} "
+                      f"固化={result.get('newly_permanent',0)} 写入={result.get('added',0)})，触发重规划")
                 self._need_replan = True
         except Exception as e:
             print(f"[ERROR] 障碍物融合失败: {e}")
@@ -400,6 +407,16 @@ class MainWindow(QMainWindow):
         self.set_status("导航已停止", "orange")
 
     def nav_step(self):
+        # ---- 自动导航：帧数 > 30 时自动开始导航到 (450, -190) ----
+        if not self._auto_nav_triggered and self.mapper.frame_count > 30:
+            self._auto_nav_triggered = True
+            self.target_x.setText("450")
+            self.target_y.setText("-190")
+            self.target_theta_deg.setText("0")
+            self.navigator._nav_count = 0  # 确保作为首次导航，走起点保护流程
+            print("[AUTO] 帧数已达30+，自动开始导航 → (450, -190) @0°")
+            self.start_navigation()
+
         self._process_pending_obstacles()
 
         is_active = self.navigator.is_active()
@@ -417,6 +434,18 @@ class MainWindow(QMainWindow):
 
         with self.mapper.lock:
             x, y, theta = self.mapper.pose.x, self.mapper.pose.y, self.mapper.pose.theta
+
+        # ---- 定期检测路径是否被新障碍物阻挡（每 0.5 秒） ----
+        now = time.time()
+        if not hasattr(self, '_last_path_blocked_check'):
+            self._last_path_blocked_check = 0.0
+        if (now - self._last_path_blocked_check > 0.5
+                and self.navigator.state == "FOLLOWING"
+                and not self._need_replan):
+            self._last_path_blocked_check = now
+            if self.navigator.check_path_blocked():
+                print("[PATH_CHECK] 检测到前方路径点被障碍物阻挡，触发重规划")
+                self._need_replan = True
 
         if self._need_replan:
             self._need_replan = False
@@ -586,6 +615,7 @@ class MainWindow(QMainWindow):
         self._last_obstacle_fusion = 0.0
         self._alignment_ack_done = False
         self._need_replan = False
+        self._auto_nav_triggered = False
         self._pending_obstacles.clear()
 
         # 7. 重置所有界面标签
