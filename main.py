@@ -191,37 +191,14 @@ class MainWindow(QMainWindow):
         self.btn_send_ack.clicked.connect(self.on_manual_send_ack)
         right_layout.addWidget(self.btn_send_ack)
 
-        # right_layout.addSpacing(10)
-        # hold_title = QLabel("▎速度持续控制 (按住发送，松开停止)")
-        # hold_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #ffcc00;")
-        # right_layout.addWidget(hold_title)
-        #
-        # self.vx_input = QLineEdit("100")
-        # self.vy_input = QLineEdit("100")
-        # self.vw_input = QLineEdit("30")
-        # for inp in (self.vx_input, self.vy_input, self.vw_input):
-        #     inp.setStyleSheet(
-        #         "font-size: 12px; padding: 5px; background-color: #2a2a2a; color: #fff; border: 1px solid #555;"
-        #     )
-        #
-        # self.btn_hold_all = QPushButton("🚀 长按发送速度")
-        # self.btn_hold_all.setStyleSheet(
-        #     "font-size: 14px; padding: 10px; background-color: #ff8800; color: white; font-weight: bold;"
-        # )
-        # self.btn_hold_all.pressed.connect(self.on_hold_pressed)
-        # self.btn_hold_all.released.connect(self.on_hold_released)
-        #
-        # right_layout.addWidget(QLabel("vx 速度 (mm/s):"))
-        # right_layout.addWidget(self.vx_input)
-        # right_layout.addWidget(QLabel("vy 速度 (mm/s):"))
-        # right_layout.addWidget(self.vy_input)
-        # right_layout.addWidget(QLabel("vw 速度 (°/s):"))
-        # right_layout.addWidget(self.vw_input)
-        # right_layout.addWidget(self.btn_hold_all)
 
         self.nav_status = QLabel("导航: 空闲")
         self.nav_status.setStyleSheet("font-size: 13px; color: #00ffaa;")
         right_layout.addWidget(self.nav_status)
+
+        self.nav_target_label = QLabel("导航目标: 未设置")
+        self.nav_target_label.setStyleSheet("font-size: 12px; color: #ffcc00; line-height: 1.4;")
+        right_layout.addWidget(self.nav_target_label)
 
         right_layout.addStretch()
         splitter.addWidget(right_widget)
@@ -235,6 +212,9 @@ class MainWindow(QMainWindow):
         self.comm.new_odom.connect(self.update_odom_display)
         self.comm.status_msg.connect(self.set_status)
         self.comm.obstacle_fusion.connect(self._on_obstacle_fusion)
+
+        # 地图点击 → 设置目标并开始导航
+        self.map_view.map_clicked.connect(self.on_map_clicked)
 
         self.nav_timer = QTimer()
         self.nav_timer.timeout.connect(self.nav_step)
@@ -263,6 +243,24 @@ class MainWindow(QMainWindow):
         self._pending_obstacles.extend(obstacle_candidates)
         if len(self._pending_obstacles) > 5000:
             self._pending_obstacles = self._pending_obstacles[-2500:]
+
+    def on_map_clicked(self, wx: float, wy: float):
+        """地图点击回调：更新目标坐标输入框并自动开始导航"""
+        # 更新输入框显示
+        self.target_x.setText(f"{wx:.0f}")
+        self.target_y.setText(f"{wy:.0f}")
+
+        # 更新导航目标显示标签
+        self.nav_target_label.setText(
+            f"导航目标: ({wx:.0f}, {wy:.0f}) mm\n"
+            f"点击地图设置新目标"
+        )
+        self.nav_target_label.setStyleSheet(
+            "font-size: 12px; color: #00ffaa; line-height: 1.4;"
+        )
+
+        # 自动开始导航
+        self.start_navigation()
 
     def _process_pending_obstacles(self):
         if not self._pending_obstacles:
@@ -306,6 +304,13 @@ class MainWindow(QMainWindow):
             if success:
                 self.set_status(f"开始导航 → ({tx:.0f}, {ty:.0f}) @{ttheta_deg:.0f}°", "green")
                 self.nav_status.setText(self.navigator.get_status())
+                self.nav_target_label.setText(
+                    f"导航目标: ({tx:.0f}, {ty:.0f}) mm\n"
+                    f"角度: {ttheta_deg:.0f}° | 路径点: {len(self.navigator.get_waypoints())}个"
+                )
+                self.nav_target_label.setStyleSheet(
+                    "font-size: 12px; color: #00ffaa; line-height: 1.4;"
+                )
                 waypoints = self.navigator.get_waypoints()
                 self.nav_debug_label.setText(
                     f"路径点: {len(waypoints)}个\n"
@@ -329,8 +334,8 @@ class MainWindow(QMainWindow):
         frame = bytearray()
         frame.append(0xAA)
         frame.append(0x55)
-        frame.append(0x01)
-        frame.append(0xA1)
+        frame.append(0x01)  #02
+        frame.append(0xA1)  #A2
         checksum = sum(frame[2:]) & 0xFF
         frame.append(checksum)
         frame.append(0xBB)
@@ -390,6 +395,8 @@ class MainWindow(QMainWindow):
         self.send_velocity_command(0.0, 0.0, 0.0)
         self.nav_status.setText("导航: 已停止")
         self.nav_status.setStyleSheet("font-size: 13px; color: #ff6666;")
+        self.nav_target_label.setText("导航目标: 未设置")
+        self.nav_target_label.setStyleSheet("font-size: 12px; color: #ffcc00; line-height: 1.4;")
         self.set_status("导航已停止", "orange")
 
     def nav_step(self):
@@ -466,7 +473,7 @@ class MainWindow(QMainWindow):
             import struct
             vx_m = vx / 1000.0
             vy_m = vy / 1000.0
-            data = struct.pack('<fff', vx_m, -vy_m, vw)
+            data = struct.pack('<fff', vx_m, -vy_m, -vw)
             length = len(data)
 
             frame = bytearray()
@@ -548,31 +555,44 @@ class MainWindow(QMainWindow):
             self.set_status(f"保存失败: {e}", "red")
 
     def clear_map(self):
+        # 1. 重置地图数据
         self.mapper.clear_map()
-        self.navigator._clear_dynamic_obstacles()
-        self.navigator.cancel()
-        self.navigator._align_settle_until = 0.0
-        self.navigator._alignment_ack_sent = False
-        self.navigator._send_alignment_ack = False
-        self.navigator._align_stable_count = 0
+
+        # 2. 重新创建 Navigator（跟刚打开程序一样）
+        self.navigator = Navigator(self.mapper)
+        self.map_view.navigator = self.navigator
+
+        # 3. 重置激光里程计
         self.laser_odom.reset()
+        if self.mapper.static_map_mode and self.mapper.map is not None:
+            self.laser_odom.set_map(self.mapper.map)
+
+        # 4. 重置轮式里程计状态
         self._wheel_initialized = False
         self._last_wheel_x = 0.0
         self._last_wheel_y = 0.0
         self._last_wheel_theta = 0.0
+
+        # 5. 停止并重置速度下发
         self.send_velocity_command(0.0, 0.0, 0.0)
         self._last_vx = 0.0
         self._last_vy = 0.0
         self._last_vw = 0.0
         self._last_cmd_time = 0.0
         self._nav_was_active = False
+
+        # 6. 重置障碍物融合状态
         self._obstacle_fusion_interval = 0.5
         self._last_obstacle_fusion = 0.0
         self._alignment_ack_done = False
         self._need_replan = False
         self._pending_obstacles.clear()
+
+        # 7. 重置所有界面标签
         self.nav_status.setText("导航: 空闲")
         self.nav_status.setStyleSheet("font-size: 13px; color: #00ffaa;")
+        self.nav_target_label.setText("导航目标: 未设置")
+        self.nav_target_label.setStyleSheet("font-size: 12px; color: #ffcc00; line-height: 1.4;")
         self.nav_debug_label.setText("导航调试: 等待...")
         self.obstacle_label.setText("障碍物: 0个永久, 0个临时")
         self.loop_label.setText("闭环: ✗ 未闭合")
@@ -581,7 +601,8 @@ class MainWindow(QMainWindow):
         self.corr_label.setText("修正量: dx=0, dy=0, dθ=0°")
         self.vel_label.setText("速度: v=0 mm/s, w=0 rad/s")
         self.queue_label.setText("队列: 0/3")
-        self.set_status("地图已重置为原始静态地图", "orange")
+
+        print("[MAIN] 程序已完全重置到初始状态")
 
     def reset_odom(self):
         self.mapper.reset_odometry()

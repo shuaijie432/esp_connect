@@ -3,13 +3,16 @@
 import math
 import numpy as np
 from PyQt5.QtWidgets import QWidget
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QPainter, QColor, QPen, QFont, QImage
 
 from mapper import LidarMapper
 
 
 class MapWidget(QWidget):
+    # 信号：用户在地图上点击了一个世界坐标点 (wx, wy)
+    map_clicked = pyqtSignal(float, float)
+
     def __init__(self, mapper: LidarMapper, navigator=None, mode="combined"):
         super().__init__()
         self.mapper = mapper
@@ -26,12 +29,31 @@ class MapWidget(QWidget):
         self._grid_image_buffer = None
         self._inflated_image_buffer = None
 
+        # 启用鼠标追踪以支持点击导航
+        self.setMouseTracking(True)
+
     def world_to_screen(self, wx: float, wy: float, w: int, h: int):
         cx = w // 2 + int(self.axis_offset_x * w)
         cy = int(h * self.axis_offset_y)
         sx = cx - int(wy * self.scale)
         sy = cy - int(wx * self.scale)
         return sx, sy
+
+    def screen_to_world(self, sx: float, sy: float, w: int, h: int):
+        """将屏幕坐标转换为世界坐标 (mm)"""
+        cx = w // 2 + int(self.axis_offset_x * w)
+        cy = int(h * self.axis_offset_y)
+        wy = (cx - sx) / self.scale
+        wx = (cy - sy) / self.scale
+        return wx, wy
+
+    def mousePressEvent(self, event):
+        """鼠标点击地图：转换为世界坐标并通过信号发出"""
+        if event.button() == Qt.LeftButton:
+            w, h = self.width(), self.height()
+            wx, wy = self.screen_to_world(event.x(), event.y(), w, h)
+            self.map_clicked.emit(wx, wy)
+        super().mousePressEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
