@@ -10,6 +10,7 @@ import threading
 import warnings
 import uuid
 from queue import Queue, Empty
+from time import sleep
 
 import paho.mqtt.client as mqtt
 
@@ -32,7 +33,7 @@ MQTT_USER = "esp_send"
 MQTT_PASS = "00000000"
 TOPIC_LIDAR = "esp/f79541/data"
 TOPIC_CONTROL = "device/f79541/data"
-TOPIC_OPENMV  = "DEevi/openmv/nav"
+TOPIC_OPENMV  = "openmv/nav"
 
 MAP_SIZE_MM = 8000
 RESOLUTION_MM = 15
@@ -45,6 +46,7 @@ class Communicate(QObject):
     new_odom = pyqtSignal()
     status_msg = pyqtSignal(str, str)
     obstacle_fusion = pyqtSignal(list)
+    java_nav_trigger = pyqtSignal()
 
 
 class MainWindow(QMainWindow):
@@ -191,6 +193,16 @@ class MainWindow(QMainWindow):
         self.btn_send_ack.clicked.connect(self.on_manual_send_ack)
         right_layout.addWidget(self.btn_send_ack)
 
+        self.btn_load_wp = QPushButton("📂 加载点位文件")
+        self.btn_load_wp.setStyleSheet(
+            "font-size: 13px; padding: 8px; background-color: #6666cc; color: white; font-weight: bold;"
+        )
+        self.btn_load_wp.clicked.connect(self.load_waypoint_file)
+        right_layout.addWidget(self.btn_load_wp)
+
+        self.wp_progress_label = QLabel("点位: 未加载")
+        self.wp_progress_label.setStyleSheet("font-size: 12px; color: #cc99ff; line-height: 1.4;")
+        right_layout.addWidget(self.wp_progress_label)
 
         self.nav_status = QLabel("导航: 空闲")
         self.nav_status.setStyleSheet("font-size: 13px; color: #00ffaa;")
@@ -206,12 +218,11 @@ class MainWindow(QMainWindow):
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_display)
-        self.timer.start(200)
-
-        self.comm.new_data.connect(self.update_display)
+        self.timer.start(300)  # 200→300ms，减少 GUI 重绘频率
         self.comm.new_odom.connect(self.update_odom_display)
         self.comm.status_msg.connect(self.set_status)
         self.comm.obstacle_fusion.connect(self._on_obstacle_fusion)
+        self.comm.java_nav_trigger.connect(self._on_java_nav_trigger)
 
         # 地图点击 → 设置目标并开始导航
         self.map_view.map_clicked.connect(self.on_map_clicked)
@@ -240,10 +251,22 @@ class MainWindow(QMainWindow):
         self._obstacle_processing = False
         self._auto_nav_triggered = False
 
+        # ---- 点位文件顺序导航 ----
+        self._waypoint_list = []       # 从JSON加载的点位列表
+        self._waypoint_index = 0       # 当前点位索引
+
     def _on_obstacle_fusion(self, obstacle_candidates):
         self._pending_obstacles.extend(obstacle_candidates)
         if len(self._pending_obstacles) > 5000:
             self._pending_obstacles = self._pending_obstacles[-2500:]
+
+    def _on_java_nav_trigger(self):
+        """Java MQTT触发导航 → (1300, -175) @ 90°"""
+        print("[JAVA_NAV] 触发导航 -> (1300, -175) @ 90°")
+        self.target_x.setText("1300")
+        self.target_y.setText("-175")
+        self.target_theta_deg.setText("90")
+        self.start_navigation()
 
     def on_map_clicked(self, wx: float, wy: float):
         """地图点击回调：更新目标坐标输入框并自动开始导航"""
@@ -261,6 +284,81 @@ class MainWindow(QMainWindow):
         )
 
         # 自动开始导航
+        self.start_navigation()
+
+    # ============================================================
+    # 点位文件加载 & 顺序导航
+    # ============================================================
+    def load_waypoint_file(self):
+        """加载点位JSON文件并启动顺序导航"""
+        from PyQt5.QtWidgets import QFileDialog
+        import json
+
+        filepath, _ = QFileDialog.getOpenFileName(
+            self, "选择点位文件", "", "JSON Files (*.json)"
+        )
+        if not filepath:
+            return
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            self.set_status(f"点位文件加载失败: {e}", "red")
+            return
+
+        if not isinstance(data, list) or len(data) == 0:
+            self.set_status("点位文件格式错误（需要非空数组）", "red")
+            return
+
+        self._waypoint_list = data
+        self._waypoint_index = 0
+
+
+
+        self.set_status(
+            f"点位文件已加载: {len(data)}个目标点 | {filepath.split('/')[-1]}",
+            "green"
+        )
+        self._start_waypoint(0)
+
+    def _start_waypoint(self, index: int):
+        """启动第 index 个点位的导航"""
+        if index >= len(self._waypoint_list):
+            # 所有点位已完成
+            self.wp_progress_label.setText(
+                f"点位: ✅ 全部完成 ({len(self._waypoint_list)}/{len(self._waypoint_list)})"
+            )
+            self.wp_progress_label.setStyleSheet(
+                "font-size: 12px; color: #66ff66; line-height: 1.4;"
+            )
+            self.set_status("所有点位导航已完成！", "green")
+            self.btn_load_wp.setText("📂 加载点位文件")
+            return
+
+        wp = self._waypoint_list[index]
+        name = wp.get("name", f"点{index+1}")
+        tx = float(wp["x"])
+        ty = float(wp["y"])
+        ttheta_deg = float(wp.get("theta_deg", 0))
+
+        # 更新界面输入框
+        self.target_x.setText(f"{tx:.0f}")
+        self.target_y.setText(f"{ty:.0f}")
+        self.target_theta_deg.setText(f"{ttheta_deg:.0f}")
+
+        # 更新点位进度标签
+        self.wp_progress_label.setText(
+            f"点位: [{index+1}/{len(self._waypoint_list)}] {name}"
+        )
+        self.wp_progress_label.setStyleSheet(
+            "font-size: 12px; color: #cc99ff; line-height: 1.4;"
+        )
+        self.btn_load_wp.setText(f"📍 [{index+1}/{len(self._waypoint_list)}] {name}")
+
+        print(f"[WP] 启动点位 [{index+1}/{len(self._waypoint_list)}] "
+              f"\"{name}\" → ({tx:.0f}, {ty:.0f}) @{ttheta_deg:.0f}°")
+
         self.start_navigation()
 
     def _process_pending_obstacles(self):
@@ -338,29 +436,50 @@ class MainWindow(QMainWindow):
         if self.client is None or not self.client.is_connected():
             return
 
+        def _send_openmv():
+            if self.client is not None and self.client.is_connected():
+                try:
+                    self.client.publish(TOPIC_OPENMV, "1", qos=1)
+                    print(f"[CMD] 角度对准标志位已发送(OpenMV) -> {TOPIC_OPENMV}")
+                except Exception as e:
+                    print(f"[CMD] OpenMV发送失败: {e}")
+
+        # _send_openmv()
+
+        self._alignment_ack_done = True
+
+    def _send_openmv_signal(self):
+        """点1到达后，发字符串 \"1\" 给 OpenMV"""
+        if self.client is None or not self.client.is_connected():
+            print("[WP] MQTT未连接，无法发送OpenMV信号")
+            return
+        try:
+            self.client.publish(TOPIC_OPENMV, "1", qos=1)
+            print(f"[WP] 点1到达 → OpenMV信号已发送 -> {TOPIC_OPENMV}")
+        except Exception as e:
+            print(f"[WP] OpenMV信号发送失败: {e}")
+
+    def send_last_waypoint_frame(self):
+        """到达最后点位后，发送 0xA2 帧到 ESP32"""
+        if self.client is None or not self.client.is_connected():
+            print("[WP] MQTT未连接，无法发送最后点位完成帧")
+            return
+
         frame = bytearray()
         frame.append(0xAA)
         frame.append(0x55)
-        frame.append(0x01)  #02
-        frame.append(0xA1)  #A2
+        frame.append(0x01)
+        frame.append(0xA2)
         checksum = sum(frame[2:]) & 0xFF
         frame.append(checksum)
         frame.append(0xBB)
-        #
-        # try:
-        #     self.client.publish(TOPIC_CONTROL, bytes(frame), qos=1)
-        #     hex_str = ' '.join(f'{b:02X}' for b in frame)
-        #     print(f"[CMD] 导航完成校验帧已发送(ESP32) | HEX[{hex_str}]")
-        # except Exception as e:
-        #     print(f"[CMD] 发送失败: {e}")
-        #
-        # try:
-        #     self.client.publish(TOPIC_OPENMV, "1", qos=1)
-        #     print(f"[CMD] 角度对准标志位已发送(OpenMV) -> {TOPIC_OPENMV}")
-        # except Exception as e:
-        #     print(f"[CMD] OpenMV发送失败: {e}")
 
-        self._alignment_ack_done = True
+        try:
+            self.client.publish(TOPIC_CONTROL, bytes(frame), qos=1)
+            hex_str = ' '.join(f'{b:02X}' for b in frame)
+            print(f"[WP] 最后点位完成帧已发送 -> {TOPIC_CONTROL} | HEX[{hex_str}]")
+        except Exception as e:
+            print(f"[WP] 最后点位完成帧发送失败: {e}")
 
     def on_manual_send_ack(self):
         self.send_alignment_ack_frame()
@@ -404,6 +523,12 @@ class MainWindow(QMainWindow):
         self.nav_status.setStyleSheet("font-size: 13px; color: #ff6666;")
         self.nav_target_label.setText("导航目标: 未设置")
         self.nav_target_label.setStyleSheet("font-size: 12px; color: #ffcc00; line-height: 1.4;")
+        # 重置点位顺序导航
+        self._waypoint_list.clear()
+        self._waypoint_index = 0
+        self.wp_progress_label.setText("点位: 未加载")
+        self.wp_progress_label.setStyleSheet("font-size: 12px; color: #cc99ff; line-height: 1.4;")
+        self.btn_load_wp.setText("📂 加载点位文件")
         self.set_status("导航已停止", "orange")
 
     def nav_step(self):
@@ -428,6 +553,25 @@ class MainWindow(QMainWindow):
             if self._nav_was_active:
                 self.send_velocity_command(0.0, 0.0, 0.0)
                 self._nav_was_active = False
+
+                # ---- 点位顺序导航：当前点完成 → 自动启动下一点 ----
+                if (self.navigator.state == "DONE"
+                        and self._waypoint_list
+                        and self._waypoint_index + 1 < len(self._waypoint_list)):
+
+                    # 点1 完成 → 发 "1" 给 OpenMV
+                    if self._waypoint_index == 0:
+                        self._send_openmv_signal()
+
+                    self._waypoint_index += 1
+                    # 延迟一帧再启动，确保状态已完全清理
+                    QTimer.singleShot(500, lambda idx=self._waypoint_index: self._start_waypoint(idx))
+
+                # ---- 最后点位完成 → 发送 0xA2 帧到 ESP32 ----
+                elif (self.navigator.state == "DONE"
+                        and self._waypoint_list
+                        and self._waypoint_index + 1 >= len(self._waypoint_list)):
+                    self.send_last_waypoint_frame()
             return
 
         self._nav_was_active = True
@@ -470,9 +614,17 @@ class MainWindow(QMainWindow):
         curr = self.navigator.current_wp
 
         if send_ack:
-            self.send_alignment_ack_frame()
+            # 点位导航模式：不在对齐完成时发信号，统一由下方 DONE 检测逻辑处理
+            # （避免 send_alignment_ack_frame 向 OpenMV 误发 "1"）
+            if self._waypoint_list:
+                # 有点位列表：跳过 send_alignment_ack_frame，信号由 DONE 分支统一发送
+                print(f"[NAV] 点位角度对准完成 (idx={self._waypoint_index})，"
+                      f"最终角度: {math.degrees(theta):.1f}°，信号由DONE逻辑处理")
+            else:
+                # 手动导航模式：正常发送对齐完成帧
+                self.send_alignment_ack_frame()
+                print(f"[NAV] 角度对准完成！最终角度: {math.degrees(theta):.1f}°")
             self.navigator.state = "DONE"
-            print(f"[NAV] 角度对准完成！最终角度: {math.degrees(theta):.1f}°")
 
         now = time.time()
         if (now - self._last_cmd_time) > 0.1 or \
@@ -657,6 +809,11 @@ def create_mqtt_client(frame_queue: Queue, comm: Communicate):
             comm.status_msg.emit(f"连接失败: {rc}", "red")
 
     def on_message(client, userdata, msg):
+        if msg.topic == TOPIC_LIDAR:
+            if msg.payload == b"2":
+                print(f"[NAV_TRIGGER] 收到导航触发标志 -> 导航至 (1300, -175) @ -90°")
+                comm.java_nav_trigger.emit()
+                return
         if msg.topic != TOPIC_LIDAR:
             return
         try:
@@ -689,8 +846,9 @@ def processing_thread(frame_queue: Queue, mapper: LidarMapper, comm: Communicate
 
     while True:
         try:
-            payload = frame_queue.get(timeout=0.5)
+            payload = frame_queue.get(timeout=0.1)
         except Empty:
+            time.sleep(0.01)  # 空闲时释放 GIL
             continue
 
         current_time = time.time()
@@ -822,6 +980,8 @@ def processing_thread(frame_queue: Queue, mapper: LidarMapper, comm: Communicate
                 comm.new_data.emit()
 
             window.update_queue_status(frame_queue.qsize(), FRAME_QUEUE_SIZE)
+
+            time.sleep(0.001)  # 每帧释放 GIL，防止卡 GUI
 
         except Exception as e:
             print(f"[ERROR] 处理帧失败: {e}")

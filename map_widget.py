@@ -151,10 +151,8 @@ class MapWidget(QWidget):
         rx, ry = stats['pose'][0], stats['pose'][1]
         sx, sy = self.world_to_screen(rx, ry, w, h)
 
-        # 膨胀边界 = obstacle_margin * resolution
-        margin = self.navigator.obstacle_margin
-        resolution = self.mapper.map.resolution
-        radius_mm = margin * resolution
+        # 膨胀半径 = obstacle_margin * resolution（A* 栅格膨胀量）
+        radius_mm = self.navigator.obstacle_margin * self.mapper.map.resolution
         r = int(radius_mm * self.scale)
         if r > 5:
             pen = QPen(QColor(255, 220, 0, 200))  # 金黄色，更明显
@@ -169,8 +167,8 @@ class MapWidget(QWidget):
             painter.setPen(QColor(255, 220, 0, 220))
             painter.drawText(sx + r + 5, sy - r + 12, f"膨胀 {radius_mm:.0f}mm")
 
-        # 再画一个最小通道宽度示意（车身宽 + 2*膨胀 = 可通过的最小通道）
-        min_channel_mm = self.navigator.robot_width_mm + 2 * radius_mm if self.navigator else 900
+        # 最小通道宽度示意 = 车宽 + 2*channel_margin_mm（统一参数）
+        min_channel_mm = self.navigator.robot_width_mm + 2 * self.navigator.channel_margin_mm if self.navigator else 350
         r_channel = int(min_channel_mm / 2.0 * self.scale)
         if r_channel > r + 5:
             pen = QPen(QColor(255, 100, 100, 100))

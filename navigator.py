@@ -29,11 +29,17 @@ class Navigator:
         # 而非外接圆半径（那是旋转时才需要的）。
         self.robot_width_mm = 250.0           # 27cm 车身宽度
         self.robot_length_mm = 250.0          # 27cm 车身长度
-        self.robot_radius_mm = self.robot_width_mm / 2.0   # 135mm
-        self.safety_margin_mm = 110.0          # 从 30 加大到 80，给定位误差和车身凸出留足余量
-        self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 215mm
+        self.robot_radius_mm = self.robot_width_mm / 2.0   # 125mm
+        self.safety_margin_mm = 110.0          # DWA 安全余量（不变）
+        self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 235mm
 
-        self.obstacle_margin =8
+        # A* 栅格膨胀（不变）
+        self.obstacle_margin = 9
+
+        # ★ 最小可通过通道参数（硬编码，独立于膨胀半径）
+        #   最小通道直径 = robot_width_mm + 2 * channel_margin_mm
+        #   修改这个值影响 DWA 碰撞框 / 红色虚线圆 / 路径堵塞检测
+        self.channel_margin_mm = 65.0
         self.replan_threshold = 200.0
 
         self.replan_interval = 1.0
@@ -72,8 +78,8 @@ class Navigator:
         self._align_stable_count = 0
 
         # 障碍物永久融合参数
-        self._min_cluster_size = 6
-        self._obstacle_stability_threshold = 100.0
+        self._min_cluster_size = 4                               # 6→4，更小的障碍物也能聚类
+        self._obstacle_stability_threshold = 250.0               # 100→250，容忍定位漂移
         self._obstacle_fusion_interval = 0.5
         self._stable_obstacles = {}
         self._obstacle_id_counter = 0
@@ -89,7 +95,7 @@ class Navigator:
         # 障碍物短期记忆：DWA 避障时记住最近几秒出现过的障碍物
         # 即使当前帧没扫到也不立即"忘记"，避免雷达漏帧导致撞上
         self._local_obstacle_memory = {}       # {(grid_x, grid_y): (wx, wy, last_seen_time)}
-        self._local_obstacle_memory_ttl = 5.0  # 记忆保留 5 秒
+        self._local_obstacle_memory_ttl = 5  # 记忆保留 5 秒（原 5s 太长，导致已越过的障碍物仍阻塞 DWA）
 
         # 动态窗口避障参数
         self._dw_enabled = True
@@ -363,7 +369,7 @@ class Navigator:
                     best_match_dist = dist
                     best_match_id = obs_id
 
-            if best_match_id is not None:
+            if best_match_id is not None and best_match_dist < 500.0:  # 最大匹配距离500mm
                 obs_data = self._stable_obstacles[best_match_id]
 
                 if obs_data.get('is_permanent', False):
@@ -532,9 +538,7 @@ class Navigator:
             local_x = dx * math.cos(robot_theta) + dy * math.sin(robot_theta)
             local_y = -dx * math.sin(robot_theta) + dy * math.cos(robot_theta)
 
-            # 360° 全向感知：只过滤紧贴车身 10mm 以内的点
-            if local_x < -200:
-                continue
+            # 360° 全向感知：不按方向过滤，车尾方向也要检测
 
             age = now - t
             # 当前帧的点：完整代价；记忆中的点：代价随时间衰减
@@ -593,7 +597,7 @@ class Navigator:
 
         # 速度约束窗口 [vx_min, vx_max, vy_min, vy_max, vw_min, vw_max]
         vs = [
-            max(0.0, base_vx - max_ax * dt),               # vx_min（局部规划不主动后退）
+            max(-self.MAX_VX, base_vx - max_ax * dt),       # vx_min（全向底盘允许后退）
             min(self.MAX_VX, base_vx + max_ax * dt),       # vx_max
             max(-self.MAX_VY, base_vy - max_ay * dt),      # vy_min
             min(self.MAX_VY, base_vy + max_ay * dt),       # vy_max
@@ -606,12 +610,12 @@ class Navigator:
         # 路径在左边 → 偏好左转(负 vw)，路径在右边 → 偏好右转(正 vw)
         path_dir = self._get_path_direction_at(x, y)
         angle_to_path_at_robot = 0.0
-        path_on_left = False    # 路径在机器人左侧 → 应偏好左转
+        path_on_left = False    # navigator 内部：逆时针=正，path_on_left 表示路径在 CCW 侧
         path_dir_valid = False
         if path_dir is not None:
             path_dir_valid = True
             angle_to_path_at_robot = self._normalize_angle(path_dir - theta)
-            path_on_left = angle_to_path_at_robot > 0  # 路径方向在逆时针侧=左侧
+            path_on_left = angle_to_path_at_robot > 0  # >0 = 路径在逆时针侧(CCW)
 
         # ---- 检测狭窄程度：自适应调整预测时间和碰撞半径 ----
         near_obstacles = [d for _, _, d in self._local_obstacles if d < 600]
@@ -643,9 +647,11 @@ class Navigator:
             if path_dir_valid and abs(angle_to_path_at_robot) > math.radians(10):
                 mid_vw = (vs[4] + vs[5]) / 2.0
                 if path_on_left:
-                    vw_samples = np.linspace(vs[4], mid_vw + 0.05, 5)
-                else:
+                    # 路径在 CCW 侧(左) → 需要正 vw(CCW/左转) → 采 [mid, vs[5]]
                     vw_samples = np.linspace(mid_vw - 0.05, vs[5], 5)
+                else:
+                    # 路径在 CW 侧(右) → 需要负 vw(CW/右转) → 采 [vs[4], mid]
+                    vw_samples = np.linspace(vs[4], mid_vw + 0.05, 5)
             else:
                 vw_samples = np.linspace(vs[4], vs[5], 5)
         else:
@@ -654,9 +660,11 @@ class Navigator:
             if path_dir_valid and abs(angle_to_path_at_robot) > math.radians(10):
                 mid_vw = (vs[4] + vs[5]) / 2.0
                 if path_on_left:
-                    vw_samples = np.linspace(vs[4], mid_vw + 0.05, 5)
-                else:
+                    # 路径在 CCW 侧(左) → 需要正 vw(CCW/左转) → 采 [mid, vs[5]]
                     vw_samples = np.linspace(mid_vw - 0.05, vs[5], 5)
+                else:
+                    # 路径在 CW 侧(右) → 需要负 vw(CW/右转) → 采 [vs[4], mid]
+                    vw_samples = np.linspace(vs[4], mid_vw + 0.05, 5)
             else:
                 vw_samples = np.linspace(vs[4], vs[5], 5)
             predict_time = 0.8
@@ -680,10 +688,9 @@ class Navigator:
             ob_wy = y + ox * sin0 + oy * cos0
             obs_world.append((ob_wx, ob_wy))
 
-        # 机器人矩形半尺寸（含安全余量，mm）
-        # 矩形对角线半长 = sqrt(260² + 265²) ≈ 371mm，用于兜底上限
-        half_len = self.robot_length_mm / 2.0 + self.safety_margin_mm   # 160 + 100 = 260
-        half_wid = self.robot_width_mm / 2.0 + self.safety_margin_mm    # 165 + 100 = 265
+        # 机器人矩形半尺寸（含通道余量 channel_margin_mm）
+        half_len = self.robot_length_mm / 2.0 + self.channel_margin_mm   # 125 + 75 = 200
+        half_wid = self.robot_width_mm / 2.0 + self.channel_margin_mm    # 125 + 75 = 200
         half_diag = math.hypot(half_len, half_wid)  # ≈ 371mm
 
         # ---- 4. 对每个候选速度推演轨迹并评估 ----
@@ -748,7 +755,7 @@ class Navigator:
                             break
 
                     if collision:
-                        continue
+                        min_clearance = -999.0  # 碰撞轨迹不丢弃，但给极低间距分
 
                     final_x, final_y = traj_states[-1][0], traj_states[-1][1]
                     final_theta = traj_states[-1][2]
@@ -756,10 +763,8 @@ class Navigator:
                     # 方案B调整：取消 min_clearance 硬约束，改由评分函数中的二次惩罚处理
                     # 避免窄道中已贴墙状态导致所有轨迹被丢弃
 
-                    # 方案B调整：放宽轨迹终点路径偏离限制，允许窄道中临时修正
+                    # 路径偏离：不丢弃轨迹，靠评分中的 path_score 自然惩罚高偏离
                     path_dev = self._calc_path_deviation(final_x, final_y)
-                    if path_dev > 350.0:
-                        continue
 
                     # 关键：路径回归引力 — 轨迹终点相比当前位置是否更靠近全局路径
                     # 正值 = 正在回归路径（奖励），负值 = 正在远离路径（惩罚）
@@ -819,24 +824,9 @@ class Navigator:
                         'smooth': smooth_penalty,
                     })
 
-        # ---- 4. 无有效轨迹 → 主动往路径方向侧移探索，边探边等重规划 ----
+        # ---- 4. 所有轨迹都参与评分（无丢弃），极少数情况无候选时退回 pure pursuit ----
         if not candidates:
-            # 路径在左边 → 主动左移；路径在右边 → 主动右移（绝不后退）
-            if path_dir_valid:
-                vy_explore = (self.MAX_VY * 0.45) if path_on_left else (-self.MAX_VY * 0.45)
-            else:
-                vy_explore = 0.0
-            # vx: 最低 15mm/s 前进（绝不后退），沿路径方向
-            # vw: 对齐路径切线（允许 ±15° 偏差）
-            vx = max(15.0, min(self.MAX_VX * 0.25, base_vx * 0.15))
-            vy = vy_explore + base_vy * 0.1
-            vy = max(-self.MAX_VY * 0.5, min(self.MAX_VY * 0.5, vy))
-            vw = base_vw * 0.25
-            vw = max(-self.MAX_VW * 0.5, min(self.MAX_VW * 0.5, vw))
-            side = '左' if vy > 0 else '右'
-            print(f"[DWA] 无有效轨迹，路径在{'左' if path_on_left else '右'}侧 "
-                  f"主动{side}移探索 vx={vx:.0f} vy={vy:.0f} vw={math.degrees(vw):.0f}°/s")
-            return vx, vy, vw
+            return base_vx, base_vy, base_vw
 
         # ---- 5. 归一化 + 加权代价评估 ----
         max_goal = max(c['goal_dist'] for c in candidates) + 1e-6
@@ -858,47 +848,51 @@ class Navigator:
         nearest_obs = min([d for _, _, d in self._local_obstacles], default=1500)
         spacious = nearest_obs > 600
 
+        # 全向底盘：heading对齐(path_dir/turn_toward)权重大幅降低，
+        # 到达目标(heading)和路径贴近(path)是核心目标
         if front_dist < 300:
-            base_weights = {'heading': 0.22, 'clearance': 0.06, 'velocity': 0.02,
-                            'path': 0.30, 'path_dir': 0.05, 'vel_path': 0.14,
-                            'turn_toward': 0.10, 'regression': 0.08,
-                            'smooth': 0.01, 'rotation': 0.02}
-        elif emergency:
-            base_weights = {'heading': 0.06, 'clearance': 0.25, 'velocity': 0.04,
-                            'path': 0.12, 'path_dir': 0.04, 'vel_path': 0.18,
-                            'turn_toward': 0.12, 'regression': 0.14,
-                            'smooth': 0.03, 'rotation': 0.02}
-        elif tight_space:
-            base_weights = {'heading': 0.10, 'clearance': 0.15, 'velocity': 0.05,
-                            'path': 0.22, 'path_dir': 0.06, 'vel_path': 0.18,
-                            'turn_toward': 0.12, 'regression': 0.10,
-                            'smooth': 0.01, 'rotation': 0.01}
-        else:
-            base_weights = {'heading': 0.08, 'clearance': 0.15, 'velocity': 0.04,
-                            'path': 0.24, 'path_dir': 0.06, 'vel_path': 0.22,
-                            'turn_toward': 0.12, 'regression': 0.06,
+            base_weights = {'heading': 0.28, 'clearance': 0.08, 'velocity': 0.03,
+                            'path': 0.35, 'path_dir': 0.02, 'vel_path': 0.08,
+                            'turn_toward': 0.03, 'regression': 0.10,
                             'smooth': 0.02, 'rotation': 0.01}
+        elif emergency:
+            base_weights = {'heading': 0.10, 'clearance': 0.30, 'velocity': 0.05,
+                            'path': 0.15, 'path_dir': 0.02, 'vel_path': 0.10,
+                            'turn_toward': 0.04, 'regression': 0.20,
+                            'smooth': 0.03, 'rotation': 0.01}
+        elif tight_space:
+            base_weights = {'heading': 0.15, 'clearance': 0.18, 'velocity': 0.06,
+                            'path': 0.27, 'path_dir': 0.02, 'vel_path': 0.10,
+                            'turn_toward': 0.04, 'regression': 0.15,
+                            'smooth': 0.02, 'rotation': 0.01}
+        else:
+            base_weights = {'heading': 0.15, 'clearance': 0.15, 'velocity': 0.08,
+                            'path': 0.30, 'path_dir': 0.02, 'vel_path': 0.10,
+                            'turn_toward': 0.03, 'regression': 0.12,
+                            'smooth': 0.04, 'rotation': 0.01}
 
+        # 全向底盘：降低vel_path和turn_toward的放大倍数，
+        # 重点靠regression和path把机器人拉回全局路径
         if spacious:
             if dev < 80:
                 regression_boost = 0.3; path_boost = 0.8
-                vel_path_boost = 2.5; turn_toward_boost = 1.2
+                vel_path_boost = 1.0; turn_toward_boost = 0.5
             elif dev < 200:
                 regression_boost = 1.0; path_boost = 1.2
-                vel_path_boost = 2.0; turn_toward_boost = 1.5
+                vel_path_boost = 1.0; turn_toward_boost = 0.5
             else:
                 regression_boost = 2.5; path_boost = 2.0
-                vel_path_boost = 1.8; turn_toward_boost = 2.0
+                vel_path_boost = 1.0; turn_toward_boost = 0.5
         else:
             if dev < 80:
                 regression_boost = 0.5; path_boost = 1.0
-                vel_path_boost = 1.2; turn_toward_boost = 1.0
+                vel_path_boost = 1.0; turn_toward_boost = 0.5
             elif dev < 200:
                 regression_boost = 1.5; path_boost = 1.3
-                vel_path_boost = 1.5; turn_toward_boost = 1.3
+                vel_path_boost = 1.0; turn_toward_boost = 0.5
             else:
                 regression_boost = 2.5; path_boost = 1.8
-                vel_path_boost = 1.5; turn_toward_boost = 1.8
+                vel_path_boost = 1.0; turn_toward_boost = 0.5
 
         weights = dict(base_weights)
         weights['regression'] = base_weights['regression'] * regression_boost
@@ -983,15 +977,15 @@ class Navigator:
 
                 # 混合比例：偏离 30mm→5%, 100mm→25%, 200mm→57%, 240mm→70%(上限)
                 blend = min(0.70, max(0.05, (current_path_dev - 30) / 300.0))
-                # vw 的混合强度为 blend 的 80%（之前是 50%，太弱导致角度不回归）
-                vw_blend = blend * 0.8
+                # 全向底盘：vw混合强度大幅降低，回归主要靠vx/vy平移
+                vw_blend = blend * 0.2
 
                 vx = vx * (1.0 - blend) + reg_vx * blend
                 vy = vy * (1.0 - blend) + reg_vy * blend
                 vw = vw * (1.0 - vw_blend) + reg_vw * vw_blend
 
-                # 限幅
-                vx = max(0.0, min(self.MAX_VX, vx))
+                # 限幅（全向底盘允许后退）
+                vx = max(-self.MAX_VX, min(self.MAX_VX, vx))
                 vy = max(-self.MAX_VY, min(self.MAX_VY, vy))
                 vw = max(-self.MAX_VW, min(self.MAX_VW, vw))
 
@@ -1001,8 +995,8 @@ class Navigator:
                           f"DWA=({best_vx:.0f},{best_vy:.0f},{math.degrees(best_vw):.0f}°/s) → "
                           f"修正=({vx:.0f},{vy:.0f},{math.degrees(vw):.0f}°/s)")
 
-        # ---- 7. 硬边界限速（安全兜底） ----
-        vx = max(0.0, min(self.MAX_VX, vx))
+        # ---- 7. 硬边界限速（安全兜底，全向底盘允许后退） ----
+        vx = max(-self.MAX_VX, min(self.MAX_VX, vx))
         vy = max(-self.MAX_VY, min(self.MAX_VY, vy))
         vw = max(-self.MAX_VW, min(self.MAX_VW, vw))
 
@@ -1084,26 +1078,21 @@ class Navigator:
                 while self._stuck_pos_history and now - self._stuck_pos_history[0][2] > self._stuck_check_duration:
                     self._stuck_pos_history.popleft()
 
-        # 瞬时卡住恢复
+        # 瞬时卡住检测：不动超过2秒触发重规划，不后退
         if self.state not in ("ALIGNING", "EVADE_EMERGENCY", "AVOIDING") and self.last_pos:
             moved = math.hypot(x - self.last_pos[0], y - self.last_pos[1])
             if moved > 30:
                 self.stuck_timer = now
             elif now - self.stuck_timer > 2.0 and now > self.stuck_recovery_until:
-                print("[NAV] 瞬时卡住检测触发！执行后退恢复...")
-                self.state = "STUCK_RECOVERY"
-                self.stuck_recovery_until = now + 0.8
+                print("[NAV] 瞬时卡住检测触发！触发重规划")
+                self.stuck_recovery_until = now + 2.0  # 2秒内不重复触发
                 self.stuck_timer = now
-                return -100.0, 0.0, 0.0
+                self._unfreeze_planning_map()
+                if self.waypoints:
+                    target = self.waypoints[-1]
+                    self.set_target(target[0], target[1], self.target_theta)
+                return 0.0, 0.0, 0.0
         self.last_pos = (x, y)
-
-        if now < self.stuck_recovery_until:
-            return -100.0, 0.0, 0.0
-
-        if self.state == "STUCK_RECOVERY" and now >= self.stuck_recovery_until:
-            print("[NAV] 后退完成...")
-            self.state = "FOLLOWING"
-            return 0.0, 0.0, 0.0
 
         self._sync_waypoint_index(x, y)
 
@@ -1144,17 +1133,16 @@ class Navigator:
             if emergency:
                 self.state = "EVADE_EMERGENCY"
             # DWA 返回后退速度时，检查是否是过度保守
-            if vx < 0 and base_vx > 20:
-                if front_dist < 400:
-                    # 前方确实太近（<400mm），保留 DWA 的后退判断
-                    pass
-                else:
-                    # DWA 过度保守，回退到大幅降速的 pure pursuit
-                    vx = base_vx * 0.3
-                    vy = base_vy * 0.3
-                    vw = base_vw * 0.3
-                    print(f"[DWA] 回退过度保守(front={front_dist:.0f}mm)，"
-                          f"使用降速 pure pursuit: vx={vx:.0f}")
+            # 全向底盘允许后退：只在 DWA 明显过度保守时才回退
+            # 条件：pure pursuit 强烈想前进(base_vx>50) 且 前方空间充裕(front_dist>500)
+            # 且 DWA 选择了较强后退(vx<-20)
+            if vx < -20 and base_vx > 50 and front_dist > 500:
+                # DWA 过度保守，回退到大幅降速的 pure pursuit
+                vx = base_vx * 0.3
+                vy = base_vy * 0.3
+                vw = base_vw * 0.3
+                print(f"[DWA] 回退过度保守(front={front_dist:.0f}mm base_vx={base_vx:.0f})，"
+                      f"使用降速 pure pursuit: vx={vx:.0f}")
         else:
             vx, vy, vw = base_vx, base_vy, base_vw
 
@@ -1187,8 +1175,8 @@ class Navigator:
                 if 0 <= mx < grid.size and 0 <= my < grid.size:
                     pc_occ.add((mx, my))
 
-        # 检查接下来的 3 个路径点（含膨胀余量 3 格 = 45mm）
-        margin = 3
+        # 检查接下来的 3 个路径点（余量由 channel_margin_mm 决定）
+        margin = int(round(self.channel_margin_mm / grid.resolution))
         for i in range(self.current_wp, min(self.current_wp + 3, len(self.waypoints))):
             wx, wy = self.waypoints[i]
             mx, my = grid.world_to_map(wx, wy)
@@ -1236,10 +1224,6 @@ class Navigator:
         self.waypoints = self._smooth_path(raw_path, inflated)
         self.current_wp = 0
 
-        # 重规划时跳过启动对齐（机器人已在运动中或正在对准角度）
-        # 注意：必须在设置 self.state = "FOLLOWING" 之前检查旧状态
-        was_active = (self.state in ("FOLLOWING", "ALIGNING"))
-
         self.state = "FOLLOWING"
         self.last_replan_time = time.time()
         self.stuck_timer = time.time()
@@ -1253,9 +1237,9 @@ class Navigator:
         self._send_alignment_ack = False
         self._align_stable_count = 0
 
-        if not was_active:
-            self._startup_align_phase = 1
-            self._startup_align_stable = 0
+        # 跳过启动对齐，直接进入路径跟踪
+        self._startup_align_phase = 2
+        self._startup_align_stable = 0
 
         print(f"[NAV] 目标已设置: ({x:.0f}, {y:.0f}), 路径点: {len(self.waypoints)}个, 规划已冻结")
         return True
@@ -1596,12 +1580,10 @@ class Navigator:
                     if channel_width < 800:
                         print(f"[CHANNEL] 狭窄通道 {channel_width:.0f}mm，降速至 {channel_scale:.1f}")
 
-        if abs_angle < math.radians(75):
-            vx_raw = kp_v * local_x
-        else:
-            vx_raw = 0.0
+        # 全向底盘：目标在后方时 local_x 为负，自然产生后退速度
+        vx_raw = kp_v * local_x
 
-        vy_raw = self.KP_V * local_y * 0.35  # 降低侧移分量，优先前进+转向
+        vy_raw = self.KP_V * local_y * 0.7  # 全向底盘侧移与前移同等有效
 
         v_mag = math.hypot(vx_raw, vy_raw)
         if v_mag > max_vx:
@@ -1609,7 +1591,7 @@ class Navigator:
             vx_raw *= ratio
             vy_raw *= ratio
 
-        vx = max(0.0, min(max_vx, vx_raw))
+        vx = max(-max_vx, min(max_vx, vx_raw))  # 全向底盘允许后退
         vy = max(-max_vy, min(max_vy, vy_raw))
 
         # 增强的路径回归约束（在狭窄通道中权重更高）
@@ -1649,9 +1631,11 @@ class Navigator:
         vw_err = angle_diff * 0.9 + path_angle_diff * 0.1  # 更积极地转向目标，给绕行更多自由度
         vw = max(-max_vw, min(max_vw, self.KP_W * vw_err))
 
+        # 全向底盘：大角度差不需要大幅减速，可以后退或侧移
         if abs_angle > math.radians(60):
-            vx *= 0.3
-            print(f"[TURN] 角度差 {math.degrees(abs_angle):.1f}°，减速转向")
+            vx *= 0.6
+            if abs_angle > math.radians(90):
+                print(f"[TURN] 角度差 {math.degrees(abs_angle):.1f}°，目标在后方，减速")
 
         return vx, vy, vw
 
@@ -1802,8 +1786,7 @@ class Navigator:
 
             vx = speed * math.cos(best_dir)
             vy = speed * math.sin(best_dir)
-            if vx < 0:
-                vx = 0.0
+            # 全向底盘允许后退，不再强制截断负vx
             vw = 0.0
             print(f"[EVADE] 选择方向={math.degrees(best_dir):.0f}° vx={vx:.0f} vy={vy:.0f}")
             return vx, vy, vw
