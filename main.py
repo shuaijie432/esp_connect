@@ -250,6 +250,7 @@ class MainWindow(QMainWindow):
         self._pending_obstacles = []
         self._obstacle_processing = False
         self._auto_nav_triggered = False
+        self._is_java_nav = False      # MQTT "2" 触发的导航，对齐完成后不发 OpenMV
 
         # ---- 点位文件顺序导航 ----
         self._waypoint_list = []       # 从JSON加载的点位列表
@@ -262,10 +263,11 @@ class MainWindow(QMainWindow):
 
     def _on_java_nav_trigger(self):
         """Java MQTT触发导航 → (1300, -175) @ 90°"""
-        print("[JAVA_NAV] 触发导航 -> (1300, -175) @ 90°")
-        self.target_x.setText("1300")
-        self.target_y.setText("-175")
+        print("[JAVA_NAV] 触发导航 -> (1285, -145) @ 90°")
+        self.target_x.setText("1285")
+        self.target_y.setText("-145")
         self.target_theta_deg.setText("90")
+        self._is_java_nav = True  # 标记：对齐完成后不发 OpenMV
         self.start_navigation()
 
     def on_map_clicked(self, wx: float, wy: float):
@@ -444,7 +446,7 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     print(f"[CMD] OpenMV发送失败: {e}")
 
-        # _send_openmv()
+        _send_openmv()
 
         self._alignment_ack_done = True
 
@@ -482,7 +484,7 @@ class MainWindow(QMainWindow):
             print(f"[WP] 最后点位完成帧发送失败: {e}")
 
     def on_manual_send_ack(self):
-        self.send_alignment_ack_frame()
+        self.send_last_waypoint_frame()
         self._alignment_ack_done = True
         self.navigator.cancel()
         self.navigator._align_settle_until = 0.0
@@ -491,7 +493,7 @@ class MainWindow(QMainWindow):
         self.navigator._align_stable_count = 0
         self.nav_status.setText("导航: 手动发送完成帧")
         self.nav_status.setStyleSheet("font-size: 13px; color: #3366aa;")
-        self.set_status("已手动发送导航完成校验帧，速度下发已停止", "blue")
+        self.set_status("已手动发送 0xA2 完成帧，速度下发已停止", "blue")
 
     def on_hold_pressed(self):
         try:
@@ -572,6 +574,11 @@ class MainWindow(QMainWindow):
                         and self._waypoint_list
                         and self._waypoint_index + 1 >= len(self._waypoint_list)):
                     self.send_last_waypoint_frame()
+
+                # ---- MQTT "2" 导航完成 → 发送 0xA2 帧到 ESP32 ----
+                elif self.navigator.state == "DONE" and self._is_java_nav:
+                    self.send_last_waypoint_frame()
+                    self._is_java_nav = False
             return
 
         self._nav_was_active = True
@@ -620,8 +627,12 @@ class MainWindow(QMainWindow):
                 # 有点位列表：跳过 send_alignment_ack_frame，信号由 DONE 分支统一发送
                 print(f"[NAV] 点位角度对准完成 (idx={self._waypoint_index})，"
                       f"最终角度: {math.degrees(theta):.1f}°，信号由DONE逻辑处理")
+            elif self._is_java_nav:
+                # MQTT "2" 触发的导航：不发 OpenMV，直接标记完成
+                print(f"[NAV] Java导航角度对准完成，最终角度: {math.degrees(theta):.1f}°"
+                      f"（跳过OpenMV发送）")
             else:
-                # 手动导航模式：正常发送对齐完成帧
+                # 手动导航模式（地图点击等）：正常发送对齐完成帧
                 self.send_alignment_ack_frame()
                 print(f"[NAV] 角度对准完成！最终角度: {math.degrees(theta):.1f}°")
             self.navigator.state = "DONE"
@@ -811,7 +822,7 @@ def create_mqtt_client(frame_queue: Queue, comm: Communicate):
     def on_message(client, userdata, msg):
         if msg.topic == TOPIC_LIDAR:
             if msg.payload == b"2":
-                print(f"[NAV_TRIGGER] 收到导航触发标志 -> 导航至 (1300, -175) @ -90°")
+                print(f"[NAV_TRIGGER] 收到导航触发标志 -> 导航至 (1285, -145) @ -90°")
                 comm.java_nav_trigger.emit()
                 return
         if msg.topic != TOPIC_LIDAR:

@@ -27,6 +27,8 @@ class Navigator:
         # 机器人物理尺寸（mm）
         # 底盘支持平移过窄道，膨胀基准用车宽/2（直行通过所需最小半宽），
         # 而非外接圆半径（那是旋转时才需要的）。
+
+
         self.robot_width_mm = 250.0           # 27cm 车身宽度
         self.robot_length_mm = 250.0          # 27cm 车身长度
         self.robot_radius_mm = self.robot_width_mm / 2.0   # 125mm
@@ -78,7 +80,7 @@ class Navigator:
         self._align_stable_count = 0
 
         # 障碍物永久融合参数
-        self._min_cluster_size = 4                               # 6→4，更小的障碍物也能聚类
+        self._min_cluster_size = 3                               # 更小的障碍物也能被追踪
         self._obstacle_stability_threshold = 250.0               # 100→250，容忍定位漂移
         self._obstacle_fusion_interval = 0.5
         self._stable_obstacles = {}
@@ -95,7 +97,7 @@ class Navigator:
         # 障碍物短期记忆：DWA 避障时记住最近几秒出现过的障碍物
         # 即使当前帧没扫到也不立即"忘记"，避免雷达漏帧导致撞上
         self._local_obstacle_memory = {}       # {(grid_x, grid_y): (wx, wy, last_seen_time)}
-        self._local_obstacle_memory_ttl = 5  # 记忆保留 5 秒（原 5s 太长，导致已越过的障碍物仍阻塞 DWA）
+        self._local_obstacle_memory_ttl = 15  # 记忆保留 15 秒，与追踪器 TTL 配合使用
 
         # 动态窗口避障参数
         self._dw_enabled = True
@@ -197,8 +199,15 @@ class Navigator:
         # 2. 构建实时点云占用掩码
         pc_occ = self._build_pointcloud_occ_mask(robot_x, robot_y)
 
-        # 3. 合并两种占用
+        # 3. 合并静态占用 + 实时点云
         combined_occ = static_occ | pc_occ
+
+        # 3.5 将所有追踪中的障碍物栅格（含未固化的）叠加到占用掩码
+        #     不再写入静态地图，障碍物过期后自然消失
+        for obs_id, obs_data in self._stable_obstacles.items():
+            for mx, my in obs_data['cells']:
+                if 0 <= mx < grid.size and 0 <= my < grid.size:
+                    combined_occ[my, mx] = True
 
         # 4. 将机器人所在位置及其周围极小范围设为可通行。
         # 注意：清空半径不能太大，否则会制造"人造空洞"，导致A*路径贴着墙壁走。
@@ -338,10 +347,12 @@ class Navigator:
         expired_ids = []
         for obs_id, obs_data in self._stable_obstacles.items():
             if not obs_data.get('is_permanent', False):
-                if current_time - obs_data['last_update'] > 5.0:
+                # 未固化障碍物保留 30 秒，给足够时间累积多次观测
+                if current_time - obs_data['last_update'] > 2.0:
                     expired_ids.append(obs_id)
             else:
-                if current_time - obs_data['last_update'] > 600.0:
+                # 已固化障碍物保留 120 秒，消失后自然过期
+                if current_time - obs_data['last_update'] > 10.0:
                     expired_ids.append(obs_id)
 
         for obs_id in expired_ids:
@@ -418,29 +429,23 @@ class Navigator:
                 print(f"[OBSTACLE_TRACK] 新大障碍物 #{new_id} @({new_cx:.0f},{new_cy:.0f}) "
                       f"大小={cluster_info['size']}栅格({cluster_info['size_mm']:.0f}mm)")
 
-        # 始终将永久障碍物写入静态地图（无论是否冻结），确保重规划能感知新障碍物
-        all_cells_to_mark = set()
+        # 不再将障碍物写入静态地图。
+        # 跟踪的障碍物（无论是否永久）都通过 _get_planning_inflated_grid()
+        # 和 _update_local_costmap() 动态叠加到规划和避障中，
+        # 障碍物过期后自然消失，不留"幽灵障碍物"。
+        all_permanent_cells = set()
         for obs_id, obs_data in self._stable_obstacles.items():
             if obs_data.get('is_permanent', False):
-                all_cells_to_mark.update(obs_data['cells'])
+                all_permanent_cells.update(obs_data['cells'])
 
-        added = 0
-        for mx, my in all_cells_to_mark:
-            if 0 <= mx < grid.size and 0 <= my < grid.size:
-                # 只写入之前未被占用的栅格，避免重复计数导致无限重规划
-                if grid.log_odds[my, mx] < grid.occ_thresh + 2.0:
-                    grid.log_odds[my, mx] = grid.occ_thresh + 5.0
-                    added += 1
-
-        if added > 0:
-            self._inflated_grid = None
-            self._grid_version = -1
-            # 导航期间有新永久障碍物写入地图，标记需要重规划
-            if self._plan_frozen:
-                print(f"[OBSTACLE_TRACK] 导航中写入 {added} 个新永久障碍物栅格，需重规划")
+        # 标记需要重规划（有新障碍物出现或障碍物状态变化）
+        need_replan = (updated_count > 0 or newly_permanent > 0) and self._plan_frozen
+        if need_replan:
+            print(f"[OBSTACLE_TRACK] 障碍物变化(新增/更新={updated_count} "
+                  f"新固化={newly_permanent})，需重规划")
 
         return {
-            'added': added,
+            'added': 0,  # 不再写入静态地图，始终为 0
             'updated': updated_count,
             'stable': stable_count,
             'permanent': permanent_count + newly_permanent,
@@ -490,9 +495,11 @@ class Navigator:
 
         self._local_costmap.fill(0.0)
 
+        # 将所有追踪中的障碍物加入局部代价地图
+        # 已固化的 = 高置信度(代价100)，未固化的 = 中置信度(代价50)
         for obs_id, obs_data in self._stable_obstacles.items():
-            if not obs_data.get('is_permanent', False):
-                continue
+            is_perm = obs_data.get('is_permanent', False)
+            cost = 100.0 if is_perm else 50.0
             for mx, my in obs_data['cells']:
                 wx, wy = grid.map_to_world(mx, my)
                 dx = wx - robot_x
@@ -502,7 +509,7 @@ class Navigator:
                 lx = int(local_x / res + half)
                 ly = int(local_y / res + half)
                 if 0 <= lx < size and 0 <= ly < size:
-                    self._local_costmap[ly, lx] = 100.0
+                    self._local_costmap[ly, lx] = max(self._local_costmap[ly, lx], cost)
 
         _, world_pts = self.mapper.get_latest_points()
         self._local_obstacles = []
@@ -1159,12 +1166,12 @@ class Navigator:
         return lateral
 
     def check_path_blocked(self) -> bool:
-        """检查前方路径点是否被障碍物阻挡（用当前地图+实时点云，不用冻结快照）。
+        """检查前方路径点是否被障碍物阻挡（用当前地图+实时点云+追踪障碍物，不用冻结快照）。
         返回 True 表示路径被阻挡，需要重规划。"""
         if not self.waypoints or self.current_wp >= len(self.waypoints):
             return False
         grid = self.mapper.map
-        # 用当前实时地图（含永久障碍物）+ 实时点云判断
+        # 用当前实时地图 + 实时点云判断
         static_occ = grid.log_odds > grid.occ_thresh
         _, world_pts = self.mapper.get_latest_points()
         # 快速构建实时点云占用掩码（只检查路径点附近）
@@ -1175,6 +1182,13 @@ class Navigator:
                 if 0 <= mx < grid.size and 0 <= my < grid.size:
                     pc_occ.add((mx, my))
 
+        # 追踪中的障碍物栅格（含未固化的）
+        tracked_occ = set()
+        for obs_data in self._stable_obstacles.values():
+            for mx, my in obs_data['cells']:
+                if 0 <= mx < grid.size and 0 <= my < grid.size:
+                    tracked_occ.add((mx, my))
+
         # 检查接下来的 3 个路径点（余量由 channel_margin_mm 决定）
         margin = int(round(self.channel_margin_mm / grid.resolution))
         for i in range(self.current_wp, min(self.current_wp + 3, len(self.waypoints))):
@@ -1184,7 +1198,7 @@ class Navigator:
                 for dy in range(-margin, margin + 1):
                     nx, ny = mx + dx, my + dy
                     if 0 <= nx < grid.size and 0 <= ny < grid.size:
-                        if static_occ[ny, nx] or (nx, ny) in pc_occ:
+                        if static_occ[ny, nx] or (nx, ny) in pc_occ or (nx, ny) in tracked_occ:
                             return True
         return False
 
