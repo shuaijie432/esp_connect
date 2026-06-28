@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSplitter, QLineEdit
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint
 from PyQt5.QtGui import QFont
 
 from lidar_parser import parse_frame
@@ -26,6 +26,7 @@ from mapper import LidarMapper
 from map_widget import MapWidget
 from navigator import Navigator
 from laser_odometry import LaserOdometry
+from ws_server import WebSocketServer
 
 MQTT_HOST = "10.113.145.227"
 MQTT_PORT = 1883
@@ -33,7 +34,9 @@ MQTT_USER = "esp_send"
 MQTT_PASS = "00000000"
 TOPIC_LIDAR = "esp/f79541/data"
 TOPIC_CONTROL = "device/f79541/data"
-TOPIC_OPENMV  = "openmv/nav"
+TOPIC_OPENMV  = "openmv11/nav"
+TOPIC_OPENMV_RECV = "openmv/data"      # 接收 OpenMV 发来的数据
+
 
 MAP_SIZE_MM = 8000
 RESOLUTION_MM = 15
@@ -47,14 +50,22 @@ class Communicate(QObject):
     status_msg = pyqtSignal(str, str)
     obstacle_fusion = pyqtSignal(list)
     java_nav_trigger = pyqtSignal()
+    openmv_data = pyqtSignal(bytes)                # OpenMV 发来的原始帧数据
+    ws_map_click = pyqtSignal(int, int, int, int)  # 前端点击: img_x, img_y, img_w, img_h
+    ws_set_target = pyqtSignal(float, float)        # 前端: 设置目标坐标 → 导航
+    ws_start_nav = pyqtSignal()                     # 前端: 开始导航
+    ws_stop_nav = pyqtSignal()                      # 前端: 停止导航
+    ws_clear_map = pyqtSignal()                     # 前端: 清空地图
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, mapper: LidarMapper, comm: Communicate, client: mqtt.Client = None):
+    def __init__(self, mapper: LidarMapper, comm: Communicate, client: mqtt.Client = None,
+                 ws_server: WebSocketServer = None):
         super().__init__()
         self.mapper = mapper
         self.comm = comm
         self.client = client
+        self.ws_server = ws_server
         self.setWindowTitle("激光雷达静态地图导航")
         self.setGeometry(50, 50, 1920, 1080)
         self.showMaximized()
@@ -128,6 +139,11 @@ class MainWindow(QMainWindow):
         self.obstacle_label = QLabel("障碍物: 0个永久, 0个临时")
         self.obstacle_label.setStyleSheet("font-size: 11px; line-height: 1.4; color: #ffaa66;")
         right_layout.addWidget(self.obstacle_label)
+
+        self.openmv_label = QLabel("OpenMV: 等待数据...")
+        self.openmv_label.setStyleSheet("font-size: 12px; line-height: 1.4; color: #66ff99;")
+        self.openmv_label.setWordWrap(True)
+        right_layout.addWidget(self.openmv_label)
 
         right_layout.addStretch()
 
@@ -223,9 +239,17 @@ class MainWindow(QMainWindow):
         self.comm.status_msg.connect(self.set_status)
         self.comm.obstacle_fusion.connect(self._on_obstacle_fusion)
         self.comm.java_nav_trigger.connect(self._on_java_nav_trigger)
+        self.comm.openmv_data.connect(self._on_openmv_data)
 
         # 地图点击 → 设置目标并开始导航
         self.map_view.map_clicked.connect(self.on_map_clicked)
+
+        # 前端 WebSocket 操作 → 和本地按钮效果一致
+        self.comm.ws_map_click.connect(self.handle_ws_map_click)
+        self.comm.ws_set_target.connect(self.on_map_clicked)
+        self.comm.ws_start_nav.connect(self.start_navigation)
+        self.comm.ws_stop_nav.connect(self.stop_navigation)
+        self.comm.ws_clear_map.connect(self.clear_map)
 
         self.nav_timer = QTimer()
         self.nav_timer.timeout.connect(self.nav_step)
@@ -263,30 +287,89 @@ class MainWindow(QMainWindow):
 
     def _on_java_nav_trigger(self):
         """Java MQTT触发导航 → (1300, -175) @ 90°"""
-        print("[JAVA_NAV] 触发导航 -> (1285, -145) @ 90°")
-        self.target_x.setText("1285")
-        self.target_y.setText("-145")
+        print("[JAVA_NAV] 触发导航 -> (1280, -190) @ 90°")
+        self.target_x.setText("1270")
+        self.target_y.setText("-190")
         self.target_theta_deg.setText("90")
         self._is_java_nav = True  # 标记：对齐完成后不发 OpenMV
         self.start_navigation()
 
+    def _on_openmv_data(self, data: bytes):
+        """处理 OpenMV 发来的数据"""
+        hex_str = ' '.join(f'{b:02X}' for b in data)
+        data_len = len(data)
+        print(f"[OPENMV] 数据处理: {hex_str} (长度={data_len})")
+
+        # 根据数据内容做具体处理
+        if data_len == 1:
+            cmd = data[0]
+            if cmd == 0xA2:
+                self.openmv_label.setText(f"OpenMV: 收到 0xA2 → 导航至 (1130, -1540)")
+                self.openmv_label.setStyleSheet(
+                    "font-size: 12px; line-height: 1.4; color: #66ff66;"
+                )
+                print("[OPENMV] → 收到 0xA2，触发导航 → (1130, -1540) @ -180°")
+                # 自动触发导航
+                self.target_x.setText("1130")
+                self.target_y.setText("-1540")
+                self.target_theta_deg.setText("-180")
+                self.start_navigation()
+            elif cmd == 0x02:
+                self.openmv_label.setText(f"OpenMV: 收到指令 0x02")
+                self.openmv_label.setStyleSheet(
+                    "font-size: 12px; line-height: 1.4; color: #ffcc00;"
+                )
+                print("[OPENMV] → 指令 0x02")
+            else:
+                self.openmv_label.setText(f"OpenMV: 0x{cmd:02X}")
+                self.openmv_label.setStyleSheet(
+                    "font-size: 12px; line-height: 1.4; color: #66ff99;"
+                )
+        else:
+            self.openmv_label.setText(f"OpenMV: [{hex_str}]")
+            self.openmv_label.setStyleSheet(
+                "font-size: 12px; line-height: 1.4; color: #66ff99;"
+            )
+
     def on_map_clicked(self, wx: float, wy: float):
         """地图点击回调：更新目标坐标输入框并自动开始导航"""
-        # 更新输入框显示
         self.target_x.setText(f"{wx:.0f}")
         self.target_y.setText(f"{wy:.0f}")
-
-        # 更新导航目标显示标签
         self.nav_target_label.setText(
-            f"导航目标: ({wx:.0f}, {wy:.0f}) mm\n"
-            f"点击地图设置新目标"
+            f"导航目标: ({wx:.0f}, {wy:.0f}) mm\n点击地图设置新目标"
         )
         self.nav_target_label.setStyleSheet(
             "font-size: 12px; color: #00ffaa; line-height: 1.4;"
         )
-
-        # 自动开始导航
         self.start_navigation()
+
+    def handle_ws_map_click(self, img_x: int, img_y: int, img_w: int, img_h: int):
+        """前端点击截图 → 像素坐标转为世界坐标 → 触发导航（在主线程执行）"""
+        map_view = self.map_view
+
+        # 1. 图片坐标 → 窗口坐标（处理可能的缩放）
+        scale_x = self.width() / img_w if img_w > 0 else 1.0
+        scale_y = self.height() / img_h if img_h > 0 else 1.0
+        win_x = int(img_x * scale_x)
+        win_y = int(img_y * scale_y)
+
+        # 2. MapWidget 在窗口中的区域
+        map_pos = map_view.mapTo(self, QPoint(0, 0))
+        map_w = map_view.width()
+        map_h = map_view.height()
+
+        # 3. 只在点击地图区域时触发
+        if not (map_pos.x() <= win_x <= map_pos.x() + map_w and
+                map_pos.y() <= win_y <= map_pos.y() + map_h):
+            return
+
+        # 4. 窗口坐标 → MapWidget 内坐标 → 世界坐标
+        mx = win_x - map_pos.x()
+        my = win_y - map_pos.y()
+        wx, wy = map_view.screen_to_world(mx, my, map_w, map_h)
+
+        print(f"[WS] 前端地图点击: 图片({img_x},{img_y}) → 世界({wx:.0f},{wy:.0f})mm")
+        self.on_map_clicked(wx, wy)
 
     # ============================================================
     # 点位文件加载 & 顺序导航
@@ -709,6 +792,11 @@ class MainWindow(QMainWindow):
             self.loop_label.setText("闭环: ✗ 未闭合")
             self.loop_label.setStyleSheet("font-size: 14px; color: #ff6666; font-weight: bold;")
 
+        # WebSocket 广播：截图推送 GUI 界面到 Vue 前端
+        if self.ws_server:
+            self.ws_server.broadcast_full_state()
+            self.ws_server.broadcast_window_image(quality=80)
+
     def update_odom_display(self):
         odom_stats = self.mapper.get_odom_stats()
         self.odom_label.setText(
@@ -788,6 +876,8 @@ class MainWindow(QMainWindow):
         self.nav_target_label.setStyleSheet("font-size: 12px; color: #ffcc00; line-height: 1.4;")
         self.nav_debug_label.setText("导航调试: 等待...")
         self.obstacle_label.setText("障碍物: 0个永久, 0个临时")
+        self.openmv_label.setText("OpenMV: 等待数据...")
+        self.openmv_label.setStyleSheet("font-size: 12px; line-height: 1.4; color: #66ff99;")
         self.loop_label.setText("闭环: ✗ 未闭合")
         self.loop_label.setStyleSheet("font-size: 14px; color: #ff6666; font-weight: bold;")
         self.odom_label.setText("里程计: 等待数据...")
@@ -813,29 +903,59 @@ def create_mqtt_client(frame_queue: Queue, comm: Communicate):
         if rc == 0:
             print(f"[MQTT] 已连接到 {MQTT_HOST}:{MQTT_PORT}")
             client.subscribe(TOPIC_LIDAR, qos=0)
+            client.subscribe(TOPIC_OPENMV_RECV, qos=0)
             print(f"[MQTT] 已订阅 {TOPIC_LIDAR}")
+            print(f"[MQTT] 已订阅 {TOPIC_OPENMV_RECV} (OpenMV接收)")
             comm.status_msg.emit(f"已连接 - {MQTT_HOST}", "green")
         else:
             print(f"[MQTT] 连接失败: {rc}")
             comm.status_msg.emit(f"连接失败: {rc}", "red")
 
     def on_message(client, userdata, msg):
+        # ---- 激光雷达数据 ----
         if msg.topic == TOPIC_LIDAR:
             if msg.payload == b"2":
                 print(f"[NAV_TRIGGER] 收到导航触发标志 -> 导航至 (1285, -145) @ -90°")
                 comm.java_nav_trigger.emit()
                 return
-        if msg.topic != TOPIC_LIDAR:
+            try:
+                if frame_queue.full():
+                    try:
+                        frame_queue.get_nowait()
+                    except Empty:
+                        pass
+                frame_queue.put_nowait(msg.payload)
+            except Exception:
+                pass
             return
-        try:
-            if frame_queue.full():
-                try:
-                    frame_queue.get_nowait()
-                except Empty:
-                    pass
-            frame_queue.put_nowait(msg.payload)
-        except Exception:
-            pass
+
+        # ---- OpenMV 接收数据 (直接接收，兼容二进制 + ASCII hex 文本) ----
+        if msg.topic == TOPIC_OPENMV_RECV:
+            payload = msg.payload
+
+            # 尝试转为纯二进制字节
+            raw_bytes = None
+            if isinstance(payload, (bytes, bytearray)):
+                # 方式1: 已经是二进制字节
+                if len(payload) <= 64 and all(b < 0x7F for b in payload):
+                    # 可能是 ASCII 文本，尝试解码
+                    try:
+                        text = payload.decode('ascii').strip()
+                        hex_str = ''.join(text.split())
+                        if all(c in '0123456789abcdefABCDEF' for c in hex_str):
+                            raw_bytes = bytes.fromhex(hex_str)
+                    except (ValueError, UnicodeDecodeError):
+                        pass
+                if raw_bytes is None:
+                    raw_bytes = bytes(payload)
+
+            if raw_bytes is None:
+                return
+
+            hex_str = ' '.join(f'{b:02X}' for b in raw_bytes)
+            print(f"[OPENMV] 收到: {hex_str}")
+            comm.openmv_data.emit(raw_bytes)
+            return
 
     def on_disconnect(client, userdata, rc):
         if rc != 0:
@@ -1013,10 +1133,23 @@ def main():
     )
     comm = Communicate()
 
+    # 启动 WebSocket 服务
+    ws_server = WebSocketServer(host="0.0.0.0", port=8765)
+    ws_server.start()
+
     frame_queue = Queue(maxsize=FRAME_QUEUE_SIZE)
     client = create_mqtt_client(frame_queue, comm)
 
-    window = MainWindow(mapper, comm, client)
+    window = MainWindow(mapper, comm, client, ws_server)
+    # 绑定主窗口和 MapWidget
+    ws_server.set_main_window(window)
+    ws_server.set_map_view(window.map_view)
+    # 前端操作 → 通过信号安全传递到主线程
+    ws_server.on_map_click(lambda ix, iy, iw, ih: comm.ws_map_click.emit(ix, iy, iw, ih))
+    ws_server.on_set_target(lambda x, y, theta: comm.ws_set_target.emit(x, y))
+    ws_server.on_start_nav(lambda: comm.ws_start_nav.emit())
+    ws_server.on_stop_nav(lambda: comm.ws_stop_nav.emit())
+    ws_server.on_clear_map(lambda: comm.ws_clear_map.emit())
     window.show()
 
     proc_thread = threading.Thread(
