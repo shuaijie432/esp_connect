@@ -35,13 +35,14 @@ class Navigator:
         self.safety_margin_mm = 110.0          # DWA 安全余量（不变）
         self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 235mm
 
-        # A* 栅格膨胀（不变）
+        # A* 栅格膨胀：每个栅格 15mm，16 次膨胀 ≈ 240mm
+        # 匹配 total_inflation_mm(235) = robot_radius(125) + safety_margin(110)
         self.obstacle_margin = 9
 
         # ★ 最小可通过通道参数（硬编码，独立于膨胀半径）
         #   最小通道直径 = robot_width_mm + 2 * channel_margin_mm
         #   修改这个值影响 DWA 碰撞框 / 红色虚线圆 / 路径堵塞检测
-        self.channel_margin_mm = 65.0
+        self.channel_margin_mm = 100.0
         self.replan_threshold = 200.0
 
         self.replan_interval = 1.0
@@ -348,11 +349,11 @@ class Navigator:
         for obs_id, obs_data in self._stable_obstacles.items():
             if not obs_data.get('is_permanent', False):
                 # 未固化障碍物保留 30 秒，给足够时间累积多次观测
-                if current_time - obs_data['last_update'] > 2.0:
+                if current_time - obs_data['last_update'] > 10.0:
                     expired_ids.append(obs_id)
             else:
                 # 已固化障碍物保留 120 秒，消失后自然过期
-                if current_time - obs_data['last_update'] > 10.0:
+                if current_time - obs_data['last_update'] > 120.0:
                     expired_ids.append(obs_id)
 
         for obs_id in expired_ids:
@@ -1133,8 +1134,8 @@ class Navigator:
             if front_dist < 250.0:
                 print(f"[BRAKE] 前方障碍物 {front_dist:.0f}mm，速度缩放至 {speed_scale:.2f}")
 
-        # 局部规划：统一使用标准 DWA（CAUTION / EMERGENCY 都走代价评估）
-        if self._dw_enabled and obstacle_level != "CLEAR":
+        # 局部规划：导航期间始终使用 DWA 进行实时避障
+        if self._dw_enabled:
             emergency = (obstacle_level == "EMERGENCY")
             vx, vy, vw = self._dynamic_window_avoidance(x, y, theta, base_vx, base_vy, base_vw, emergency=emergency)
             if emergency:

@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSplitter, QLineEdit
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint, QRect
 from PyQt5.QtGui import QFont
 
 from lidar_parser import parse_frame
@@ -34,7 +34,7 @@ MQTT_USER = "esp_send"
 MQTT_PASS = "00000000"
 TOPIC_LIDAR = "esp/f79541/data"
 TOPIC_CONTROL = "device/f79541/data"
-TOPIC_OPENMV  = "openmv11/nav"
+TOPIC_OPENMV  = "openmv/nav"
 TOPIC_OPENMV_RECV = "openmv/data"      # 接收 OpenMV 发来的数据
 
 
@@ -50,12 +50,15 @@ class Communicate(QObject):
     status_msg = pyqtSignal(str, str)
     obstacle_fusion = pyqtSignal(list)
     java_nav_trigger = pyqtSignal()
+    nav_zero_trigger = pyqtSignal()                # MQTT "0" 触发导航 → (400, -1450) @ -90°
     openmv_data = pyqtSignal(bytes)                # OpenMV 发来的原始帧数据
     ws_map_click = pyqtSignal(int, int, int, int)  # 前端点击: img_x, img_y, img_w, img_h
     ws_set_target = pyqtSignal(float, float)        # 前端: 设置目标坐标 → 导航
     ws_start_nav = pyqtSignal()                     # 前端: 开始导航
     ws_stop_nav = pyqtSignal()                      # 前端: 停止导航
     ws_clear_map = pyqtSignal()                     # 前端: 清空地图
+    ws_cmd_5 = pyqtSignal()                        # 前端: 发送 "5"
+    ws_cmd_6 = pyqtSignal()                        # 前端: 发送 "6"
 
 
 class MainWindow(QMainWindow):
@@ -239,6 +242,7 @@ class MainWindow(QMainWindow):
         self.comm.status_msg.connect(self.set_status)
         self.comm.obstacle_fusion.connect(self._on_obstacle_fusion)
         self.comm.java_nav_trigger.connect(self._on_java_nav_trigger)
+        self.comm.nav_zero_trigger.connect(self._on_nav_zero_trigger)
         self.comm.openmv_data.connect(self._on_openmv_data)
 
         # 地图点击 → 设置目标并开始导航
@@ -250,6 +254,8 @@ class MainWindow(QMainWindow):
         self.comm.ws_start_nav.connect(self.start_navigation)
         self.comm.ws_stop_nav.connect(self.stop_navigation)
         self.comm.ws_clear_map.connect(self.clear_map)
+        self.comm.ws_cmd_5.connect(self._on_ws_cmd_5)
+        self.comm.ws_cmd_6.connect(self._on_ws_cmd_6)
 
         self.nav_timer = QTimer()
         self.nav_timer.timeout.connect(self.nav_step)
@@ -259,6 +265,7 @@ class MainWindow(QMainWindow):
         self._last_vy = 0.0
         self._last_vw = 0.0
         self._last_cmd_time = 0.0
+        self._last_nav_state = self.navigator.state
         self._nav_was_active = False
 
         self._obstacle_fusion_interval = 0.5
@@ -275,6 +282,7 @@ class MainWindow(QMainWindow):
         self._obstacle_processing = False
         self._auto_nav_triggered = False
         self._is_java_nav = False      # MQTT "2" 触发的导航，对齐完成后不发 OpenMV
+        self._is_openmv_nav = False   # OpenMV 0xA2 触发的导航，完成后发 "1" 给 OpenMV
 
         # ---- 点位文件顺序导航 ----
         self._waypoint_list = []       # 从JSON加载的点位列表
@@ -287,11 +295,37 @@ class MainWindow(QMainWindow):
 
     def _on_java_nav_trigger(self):
         """Java MQTT触发导航 → (1300, -175) @ 90°"""
-        print("[JAVA_NAV] 触发导航 -> (1280, -190) @ 90°")
-        self.target_x.setText("1270")
-        self.target_y.setText("-190")
+        print("[JAVA_NAV] 触发导航 -> (1230, -130) @ 90°")
+        self.target_x.setText("1290")
+        self.target_y.setText("-130")
         self.target_theta_deg.setText("90")
         self._is_java_nav = True  # 标记：对齐完成后不发 OpenMV
+        self.start_navigation()
+
+    def _on_nav_zero_trigger(self):
+        """MQTT "0" 触发导航 → (400, -1450) @ -90°"""
+        print("[NAV_ZERO] 触发导航 -> (400, -1450) @ -90°")
+        self.target_x.setText("370")
+        self.target_y.setText("-1500")
+        self.target_theta_deg.setText("-90")
+        self._is_java_nav = True  # 标记：对齐完成后不发 OpenMV
+        self.start_navigation()
+
+    def _on_ws_cmd_5(self):
+        """前端 WebSocket 发送 "5" → 触发导航（帧数>30后由前端确认启动）"""
+        print("[WS_CMD_5] 前端触发 → 导航至 (450, -60) @ 0°")
+        self.target_x.setText("450")
+        self.target_y.setText("-60")
+        self.target_theta_deg.setText("0")
+        self.navigator._nav_count = 0  # 确保作为首次导航，走起点保护流程
+        self.start_navigation()
+
+    def _on_ws_cmd_6(self):
+        """前端 WebSocket 发送 "6" → 导航至 (1170, -1520) @ -180°"""
+        print("[WS_CMD_6] 前端触发 → 导航至 (1170, -1520) @ -180°")
+        self.target_x.setText("1170")
+        self.target_y.setText("-1520")
+        self.target_theta_deg.setText("-180")
         self.start_navigation()
 
     def _on_openmv_data(self, data: bytes):
@@ -304,15 +338,16 @@ class MainWindow(QMainWindow):
         if data_len == 1:
             cmd = data[0]
             if cmd == 0xA2:
-                self.openmv_label.setText(f"OpenMV: 收到 0xA2 → 导航至 (1130, -1540)")
+                self.openmv_label.setText(f"OpenMV: 收到 0xA2 → 导航至 (1170, -1520)")
                 self.openmv_label.setStyleSheet(
                     "font-size: 12px; line-height: 1.4; color: #66ff66;"
                 )
-                print("[OPENMV] → 收到 0xA2，触发导航 → (1130, -1540) @ -180°")
+                print("[OPENMV] → 收到 0xA2，触发导航 → (1170, -1520) @ -180°")
                 # 自动触发导航
-                self.target_x.setText("1130")
-                self.target_y.setText("-1540")
+                self.target_x.setText("1170")
+                self.target_y.setText("-1520")
                 self.target_theta_deg.setText("-180")
+                self._is_openmv_nav = True  # 标记：完成后发 "1" 给 OpenMV
                 self.start_navigation()
             elif cmd == 0x02:
                 self.openmv_label.setText(f"OpenMV: 收到指令 0x02")
@@ -617,15 +652,6 @@ class MainWindow(QMainWindow):
         self.set_status("导航已停止", "orange")
 
     def nav_step(self):
-        # ---- 自动导航：帧数 > 30 时自动开始导航到 (450, -190) ----
-        if not self._auto_nav_triggered and self.mapper.frame_count > 30:
-            self._auto_nav_triggered = True
-            self.target_x.setText("450")
-            self.target_y.setText("-190")
-            self.target_theta_deg.setText("0")
-            self.navigator._nav_count = 0  # 确保作为首次导航，走起点保护流程
-            print("[AUTO] 帧数已达30+，自动开始导航 → (450, -190) @0°")
-            self.start_navigation()
 
         self._process_pending_obstacles()
 
@@ -662,6 +688,11 @@ class MainWindow(QMainWindow):
                 elif self.navigator.state == "DONE" and self._is_java_nav:
                     self.send_last_waypoint_frame()
                     self._is_java_nav = False
+
+                # ---- OpenMV 0xA2 导航完成 → 发送 "1" 给 OpenMV ----
+                elif self.navigator.state == "DONE" and self._is_openmv_nav:
+                    self._send_openmv_signal()
+                    self._is_openmv_nav = False
             return
 
         self._nav_was_active = True
@@ -714,6 +745,10 @@ class MainWindow(QMainWindow):
                 # MQTT "2" 触发的导航：不发 OpenMV，直接标记完成
                 print(f"[NAV] Java导航角度对准完成，最终角度: {math.degrees(theta):.1f}°"
                       f"（跳过OpenMV发送）")
+            elif self._is_openmv_nav:
+                # OpenMV 0xA2 触发的导航：跳过对齐时发信号，由 DONE 分支统一发 "1"
+                print(f"[NAV] OpenMV导航角度对准完成，最终角度: {math.degrees(theta):.1f}°"
+                      f"（信号由DONE逻辑处理）")
             else:
                 # 手动导航模式（地图点击等）：正常发送对齐完成帧
                 self.send_alignment_ack_frame()
@@ -721,7 +756,14 @@ class MainWindow(QMainWindow):
             self.navigator.state = "DONE"
 
         now = time.time()
-        if (now - self._last_cmd_time) > 0.1 or \
+        # 检测导航状态切换：状态变化时强制发送速度指令，避免限流器导致
+        # ESP32 继续执行旧指令（例如 FOLLOWING→ALIGNING 时侧移未清零）。
+        nav_state = self.navigator.state
+        state_changed = nav_state != self._last_nav_state
+        self._last_nav_state = nav_state
+
+        if state_changed or \
+           (now - self._last_cmd_time) > 0.1 or \
            abs(vx - self._last_vx) > 15 or \
            abs(vy - self._last_vy) > 15 or \
            abs(vw - self._last_vw) > 0.08:
@@ -792,10 +834,35 @@ class MainWindow(QMainWindow):
             self.loop_label.setText("闭环: ✗ 未闭合")
             self.loop_label.setStyleSheet("font-size: 14px; color: #ff6666; font-weight: bold;")
 
-        # WebSocket 广播：截图推送 GUI 界面到 Vue 前端
+        # WebSocket 广播：截图推送 GUI 界面到 Vue 前端（仅好果+坏果存放区）
         if self.ws_server:
             self.ws_server.broadcast_full_state()
-            self.ws_server.broadcast_window_image(quality=80)
+            # 计算棕色框在主窗口上的屏幕区域
+            mv = self.map_view
+            cr = mv.crop_rect
+            cx_c, cy_c = cr.x(), cr.y()        # 中心世界坐标
+            cw_mm, ch_mm = cr.width(), cr.height()  # 宽高 mm
+            mw, mh = mv.width(), mv.height()
+            # 四个角的世界坐标 → MapWidget 屏幕坐标
+            corners = [
+                mv.world_to_screen(cx_c - cw_mm/2, cy_c - ch_mm/2, mw, mh),
+                mv.world_to_screen(cx_c + cw_mm/2, cy_c - ch_mm/2, mw, mh),
+                mv.world_to_screen(cx_c - cw_mm/2, cy_c + ch_mm/2, mw, mh),
+                mv.world_to_screen(cx_c + cw_mm/2, cy_c + ch_mm/2, mw, mh),
+            ]
+            min_sx = min(p[0] for p in corners)
+            min_sy = min(p[1] for p in corners)
+            max_sx = max(p[0] for p in corners)
+            max_sy = max(p[1] for p in corners)
+            # MapWidget 在窗口中的偏移
+            map_pos = mv.mapTo(self, QPoint(0, 0))
+            crop_rect = QRect(
+                map_pos.x() + int(min_sx),
+                map_pos.y() + int(min_sy),
+                int(max_sx - min_sx),
+                int(max_sy - min_sy),
+            )
+            self.ws_server.broadcast_window_image(quality=95, crop_rect=crop_rect)
 
     def update_odom_display(self):
         odom_stats = self.mapper.get_odom_stats()
@@ -859,6 +926,7 @@ class MainWindow(QMainWindow):
         self._last_vy = 0.0
         self._last_vw = 0.0
         self._last_cmd_time = 0.0
+        self._last_nav_state = self.navigator.state
         self._nav_was_active = False
 
         # 6. 重置障碍物融合状态
@@ -917,6 +985,10 @@ def create_mqtt_client(frame_queue: Queue, comm: Communicate):
             if msg.payload == b"2":
                 print(f"[NAV_TRIGGER] 收到导航触发标志 -> 导航至 (1285, -145) @ -90°")
                 comm.java_nav_trigger.emit()
+                return
+            if msg.payload == b"0":
+                print(f"[NAV_TRIGGER] 收到 '0' -> 导航至 (400, -1450) @ -90°")
+                comm.nav_zero_trigger.emit()
                 return
             try:
                 if frame_queue.full():
@@ -1150,6 +1222,8 @@ def main():
     ws_server.on_start_nav(lambda: comm.ws_start_nav.emit())
     ws_server.on_stop_nav(lambda: comm.ws_stop_nav.emit())
     ws_server.on_clear_map(lambda: comm.ws_clear_map.emit())
+    ws_server.on_cmd_5(lambda: comm.ws_cmd_5.emit())
+    ws_server.on_cmd_6(lambda: comm.ws_cmd_6.emit())
     window.show()
 
     proc_thread = threading.Thread(
