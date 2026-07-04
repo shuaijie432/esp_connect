@@ -122,6 +122,7 @@ class Navigator:
         self._startup_align_phase = 2
         self._startup_align_stable = 0
         self._nav_count = 0  # 导航次数：首次=起点保护，后续=原地旋转对齐
+        self.safety_boost = 0.0  # 安全余量加成(mm)，特定导航点可临时增大
 
         try:
             if self.mapper.static_map_mode:
@@ -732,10 +733,10 @@ class Navigator:
             ob_wy = y + ox * sin0 + oy * cos0
             obs_world.append((ob_wx, ob_wy))
 
-        # 机器人矩形半尺寸（含通道余量 channel_margin_mm）
-        half_len = self.robot_length_mm / 2.0 + self.channel_margin_mm   # 125 + 75 = 200
-        half_wid = self.robot_width_mm / 2.0 + self.channel_margin_mm    # 125 + 75 = 200
-        half_diag = math.hypot(half_len, half_wid)  # ≈ 371mm
+        # 机器人矩形半尺寸（含通道余量 + 安全加成）
+        half_len = self.robot_length_mm / 2.0 + self.channel_margin_mm + self.safety_boost
+        half_wid = self.robot_width_mm / 2.0 + self.channel_margin_mm + self.safety_boost
+        half_diag = math.hypot(half_len, half_wid)
 
         # ---- 4. 对每个候选速度推演轨迹并评估 ----
         candidates = []
@@ -1152,6 +1153,8 @@ class Navigator:
                 return 0.0, 0.0, 0.0
             else:
                 self.state = "DONE"
+                self.final_approach_dist = 0.0
+                self.safety_boost = 0.0
                 print("[NAV] 到达目标！")
                 return 0.0, 0.0, 0.0
 
@@ -1374,6 +1377,8 @@ class Navigator:
         self._startup_align_phase = 2
         self._startup_align_stable = 0
         self._nav_count = 0
+        self.final_approach_dist = 0.0
+        self.safety_boost = 0.0
         self._unfreeze_planning_map()
         print("[NAV] 导航已取消，规划地图已解冻")
 
@@ -1876,7 +1881,7 @@ class Navigator:
         check_dists = [150, 300, 500]
         # 安全半径：使用矩形对角线半长 + 安全余量，确保角落也不会蹭到
         half_diag_phys = math.hypot(self.robot_length_mm / 2.0, self.robot_width_mm / 2.0)  # ≈230mm
-        safe_radius = half_diag_phys + self.safety_margin_mm  # ≈330mm，全覆盖矩形角落
+        safe_radius = half_diag_phys + self.safety_margin_mm + self.safety_boost
 
         for test_rad in test_dirs:
             safe = True

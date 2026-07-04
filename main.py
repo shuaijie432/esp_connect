@@ -300,7 +300,9 @@ class MainWindow(QMainWindow):
         self.target_x.setText("1290")
         self.target_y.setText("-130")
         self.target_theta_deg.setText("90")
-        self._is_java_nav = True  # 标记：对齐完成后不发 OpenMV
+        self._is_java_nav = True
+        self.navigator.final_approach_dist = 500.0
+        self.navigator.safety_boost = 60.0  # 碰撞框额外扩大60mm
         self.start_navigation()
 
     def _on_nav_zero_trigger(self):
@@ -309,7 +311,9 @@ class MainWindow(QMainWindow):
         self.target_x.setText("350")
         self.target_y.setText("-1500")
         self.target_theta_deg.setText("-90")
-        self._is_java_nav = True  # 标记：对齐完成后不发 OpenMV
+        self._is_java_nav = True
+        self.navigator.final_approach_dist = 500.0
+        self.navigator.safety_boost = 60.0  # 碰撞框额外扩大60mm
         self.start_navigation()
 
     def _on_ws_cmd_5(self):
