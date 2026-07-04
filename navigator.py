@@ -1028,6 +1028,17 @@ class Navigator:
         #   远离障碍物 → 紧跟全局路径
         #   靠近障碍物 → 放开路径约束，让 DWA 自由绕行
         #   绕过后 → 路径引力恢复，自动回归全局路径
+
+        # ---- 终点靠近模式：目标点附近有障碍物时，逐步放宽容忍度 ----
+        #   离目标越近，越允许靠近障碍物，避免在目标点附近徘徊
+        goal = self.waypoints[-1] if self.waypoints else (x, y)
+        dist_to_goal = math.hypot(goal[0] - x, goal[1] - y)
+        final_approach = dist_to_goal < 600  # 600mm 内进入终点靠近模式
+        if final_approach:
+            # 离目标越近，障碍物排斥力越弱（但不取消碰撞检测）
+            approach_ratio = max(0.15, dist_to_goal / 600.0)  # 600mm→1.0, 0mm→0.15
+        else:
+            approach_ratio = 1.0  # 正常模式，不影响
         if nearest_obs < 250:
             # 极近：完全放开路径约束，DWA 全权绕行
             weights['regression'] *= 0.0
@@ -1056,6 +1067,18 @@ class Navigator:
             # 安全距离：正常权重
             clearance_boost = 1.0
         weights['clearance'] = base_weights['clearance'] * clearance_boost
+
+        # ---- 终点靠近模式：逐步削弱障碍物排斥，让机器人靠近目标 ----
+        #   approach_ratio < 1.0 时，所有抑制/boost 效果向 1.0（正常）方向回退
+        #   离目标 600mm 时不影响，越近越回退，到 0mm 时保留 15% 效果
+        if approach_ratio < 1.0:
+            # 路径抑制倍数回退到 1.0（不抑制）
+            weights['regression'] = weights['regression'] + (base_weights['regression'] * regression_boost - weights['regression']) * (1.0 - approach_ratio)
+            weights['path'] = weights['path'] + (base_weights['path'] * path_boost - weights['path']) * (1.0 - approach_ratio)
+            weights['vel_path'] = weights['vel_path'] + (base_weights['vel_path'] * vel_path_boost - weights['vel_path']) * (1.0 - approach_ratio)
+            weights['turn_toward'] = weights['turn_toward'] + (base_weights['turn_toward'] * turn_toward_boost - weights['turn_toward']) * (1.0 - approach_ratio)
+            # clearance_boost 回退到 1.0
+            weights['clearance'] = weights['clearance'] + (base_weights['clearance'] - weights['clearance']) * (1.0 - approach_ratio)
 
         # 归一化权重（确保总和为 1.0）
         total_w = sum(weights.values())
@@ -1340,22 +1363,13 @@ class Navigator:
             if front_dist < 250.0:
                 print(f"[BRAKE] 前方障碍物 {front_dist:.0f}mm，速度缩放至 {speed_scale:.2f}")
 
-        # 局部规划：导航期间始终使用 DWA 进行实时避障
+        # 局部规划：所有障碍物等级统一使用 DWA（含路径引导 + 避障）
         if self._dw_enabled:
-            if obstacle_level == "EMERGENCY":
-                # 紧急避障：优先使用专门的避障函数，直接搜索安全方向
-                vx, vy, vw = self._evade_obstacle(x, y, theta)
-                self.state = "EVADE_EMERGENCY"
-                # 如果避障函数返回零速度（无点云数据），回退到 DWA 紧急模式
-                if vx == 0.0 and vy == 0.0 and vw == 0.0:
-                    vx, vy, vw = self._dynamic_window_avoidance(
-                        x, y, theta, base_vx, base_vy, base_vw, emergency=True)
-            else:
-                emergency = (obstacle_level == "CAUTION")
-                vx, vy, vw = self._dynamic_window_avoidance(
-                    x, y, theta, base_vx, base_vy, base_vw, emergency=emergency)
-                if obstacle_level == "CAUTION":
-                    self.state = "AVOIDING"
+            emergency = (obstacle_level in ("EMERGENCY", "CAUTION"))
+            vx, vy, vw = self._dynamic_window_avoidance(
+                x, y, theta, base_vx, base_vy, base_vw, emergency=emergency)
+            if obstacle_level in ("EMERGENCY", "CAUTION"):
+                self.state = "AVOIDING"
             # DWA 返回后退速度时，检查是否是过度保守
             # 全向底盘允许后退：只在 DWA 明显过度保守时才回退
             # 条件：pure pursuit 强烈想前进(base_vx>50) 且 前方空间充裕(front_dist>500)

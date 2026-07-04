@@ -34,7 +34,7 @@ MQTT_USER = "esp_send"
 MQTT_PASS = "00000000"
 TOPIC_LIDAR = "esp/f79541/data"
 TOPIC_CONTROL = "device/f79541/data"
-TOPIC_OPENMV  = "openmv/nav"
+TOPIC_OPENMV  = "openmv111/nav"
 TOPIC_OPENMV_RECV = "openmv/data"      # 接收 OpenMV 发来的数据
 
 
@@ -295,31 +295,25 @@ class MainWindow(QMainWindow):
             self._pending_obstacles = self._pending_obstacles[-2500:]
 
     def _on_java_nav_trigger(self):
-        """Java MQTT触发导航 → (1300, -175) @ 90°"""
-        print("[JAVA_NAV] 触发导航 -> (1210, -130) @ 90°")
-        self.target_x.setText("1290")
-        self.target_y.setText("-130")
-        self.target_theta_deg.setText("90")
+        """Java MQTT触发导航 → (1290, -130) @ 90°"""
+        print("[JAVA_NAV] 触发导航 -> (1290, -130) @ 90°")
         self._is_java_nav = True
-        self.start_navigation()
+        self.target_theta_deg.setText("90")
+        self.on_map_clicked(1290, -130)
+
 
     def _on_nav_zero_trigger(self):
-        """MQTT "0" 触发导航 → (350, -1450) @ -90°"""
-        print("[NAV_ZERO] 触发导航 -> (360, -1450) @ -90°")
-        self.target_x.setText("380")
-        self.target_y.setText("-1500")
+        """MQTT "0" 触发导航 → (340, -1500) @ -90°"""
+        print("[NAV_ZERO] 触发导航 -> (340, -1500) @ -90°")
+        _is_java_nav = True
         self.target_theta_deg.setText("-90")
-        self._is_java_nav = True
-        self.start_navigation()
+        self.on_map_clicked(340, -1500)
 
     def _on_ws_cmd_5(self):
-        """前端 WebSocket 发送 "5" → 触发导航（帧数>30后由前端确认启动）"""
+        """前端 WebSocket 发送 "5" → 触发导航 → (400, -90) @ 0°"""
         print("[WS_CMD_5] 前端触发 → 导航至 (400, -90) @ 0°")
-        self.target_x.setText("400")
-        self.target_y.setText("-90")
         self.target_theta_deg.setText("0")
-        self.navigator._nav_count = 0  # 确保作为首次导航，走起点保护流程
-        self.start_navigation()
+        self.on_map_clicked(400, -90)
 
     def _on_ws_cmd_6(self):
         """前端 WebSocket 发送 "6" → 导航至 (1170, -1520) @ -180°"""
