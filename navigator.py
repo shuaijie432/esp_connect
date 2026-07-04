@@ -137,13 +137,17 @@ class Navigator:
     # 冻结/解冻规划地图（修改：冻结仅保存静态快照，膨胀在调用时动态生成）
     # ============================================================
     def _freeze_planning_map(self):
+        # ★ 已冻结时不再重拍快照：整个导航过程用同一张地图，
+        #   避免里程计漂移后新快照与机器人位置对不上 → 点云"漂移"
+        if self._plan_frozen and self._planned_grid is not None:
+            print("[NAV] 规划地图保持冻结（复用已有快照，防止漂移）")
+            return self._get_planning_inflated_grid()
         grid = self.mapper.map
         self._planned_grid = grid.log_odds.copy()
         self._planned_version = time.time()
         self._plan_frozen = True
         occ_count = np.count_nonzero(self._planned_grid > grid.occ_thresh)
         print(f"[NAV] 规划地图已冻结，静态占用栅格: {occ_count}")
-        # 不再预先计算膨胀，返回动态生成的结果供外部可视化使用
         return self._get_planning_inflated_grid()
 
     def _unfreeze_planning_map(self):
@@ -769,7 +773,7 @@ class Navigator:
                     dyn_half_wid = half_wid
 
                     # ---- 矩形碰撞检测：轨迹上每个位姿检查障碍物是否侵入机器人矩形 ----
-                    # 方案B调整：跳过第0步（当前位姿附近），避免已贴墙状态锁死所有轨迹
+                    # 跳过第0步（当前位姿附近），避免已贴墙状态锁死所有轨迹
                     min_side_clearance = float('inf')  # 单独追踪侧面距离，用于侧向避障评分
                     for step_i, (tx, ty, ttheta) in enumerate(traj_states):
                         if step_i == 0:
@@ -783,24 +787,26 @@ class Navigator:
                             dx_local = dx_w * cos_t + dy_w * sin_t    # 前向分量
                             dy_local = -dx_w * sin_t + dy_w * cos_t   # 侧向分量
 
-                            if abs(dx_local) < dyn_half_len and abs(dy_local) < dyn_half_wid:
-                                collision = True
-                                break
-                            # 到矩形边界的距离（负值=已侵入，用于兜底排序）
+                            # ★ 先计算距离指标（在碰撞判断之前），确保所有轨迹都有有效值
+                            # 侧面距离：无论前向多远，侧面贴近就要惩罚
+                            side_margin = abs(dy_local) - dyn_half_wid
+                            min_side_clearance = min(min_side_clearance, side_margin)
+                            # 矩形距离：用 max 保持前向区分度
                             dist_to_rect = max(
                                 abs(dx_local) - dyn_half_len,
                                 abs(dy_local) - dyn_half_wid,
                             )
                             min_clearance = min(min_clearance, dist_to_rect)
-                            # 单独追踪侧面距离：无论前向多远，侧面贴近也要惩罚
-                            side_margin = abs(dy_local) - dyn_half_wid
-                            min_side_clearance = min(min_side_clearance, side_margin)
+
+                            if abs(dx_local) < dyn_half_len and abs(dy_local) < dyn_half_wid:
+                                collision = True
+                                break
                         if collision:
                             break
 
                     if collision:
-                        min_clearance = -999.0  # 碰撞轨迹不丢弃，但给极低间距分
-                        min_side_clearance = -999.0
+                        min_clearance = -999.0  # 碰撞标记：极低综合间距
+                        # ★ min_side_clearance 保留实际值，用于区分贴墙程度
 
                     final_x, final_y = traj_states[-1][0], traj_states[-1][1]
                     final_theta = traj_states[-1][2]
@@ -1143,7 +1149,6 @@ class Navigator:
                 moved = math.hypot(x - old_x, y - old_y)
                 if moved < self._stuck_dist_threshold and self._total_replan_count < self._max_replan:
                     print(f"[NAV] 卡住检测！{self._stuck_check_duration:.0f}秒内只移动了 {moved:.0f}mm，触发重规划 (第{self._total_replan_count+1}次)")
-                    self._unfreeze_planning_map()
                     if self.waypoints:
                         target = self.waypoints[-1]
                         if self.set_target(target[0], target[1], self.target_theta):
@@ -1164,7 +1169,6 @@ class Navigator:
                 print("[NAV] 瞬时卡住检测触发！触发重规划")
                 self.stuck_recovery_until = now + 2.0  # 2秒内不重复触发
                 self.stuck_timer = now
-                self._unfreeze_planning_map()
                 if self.waypoints:
                     target = self.waypoints[-1]
                     self.set_target(target[0], target[1], self.target_theta)
@@ -1176,7 +1180,6 @@ class Navigator:
         # 横向偏差过大 -> 重规划
         lateral_error = self._calc_lateral_error(x, y, theta)
         if lateral_error > 400.0 and now - self.last_replan_time > 5.0:
-            self._unfreeze_planning_map()
             if self.waypoints:
                 if self.set_target(self.waypoints[-1][0], self.waypoints[-1][1], self.target_theta):
                     self.last_replan_time = now
