@@ -37,7 +37,7 @@ class Navigator:
 
         # A* 栅格膨胀：每个栅格 15mm，16 次膨胀 ≈ 240mm
         # 匹配 total_inflation_mm(235) = robot_radius(125) + safety_margin(110)
-        self.obstacle_margin = 9
+        self.obstacle_margin = 7
 
         # ★ 最小可通过通道参数（硬编码，独立于膨胀半径）
         #   最小通道直径 = robot_width_mm + 2 * channel_margin_mm
@@ -66,7 +66,7 @@ class Navigator:
         self._plan_frozen = False
 
         # 速度参数（底盘支持平移）
-        self.MAX_VX = 100.0   # 从 150 降低，窄道中有更多反应时间
+        self.MAX_VX = 250.0   # 从 150 降低，窄道中有更多反应时间
         self.MAX_VY = 100.0   # 降低侧移最大速度，减少侧移使用频率
         self.MAX_VW = 0.2     # 提高角速度上限，增强转向绕行能力
         self.KP_V = 0.5
@@ -772,41 +772,45 @@ class Navigator:
                     dyn_half_len = half_len
                     dyn_half_wid = half_wid
 
-                    # ---- 矩形碰撞检测：轨迹上每个位姿检查障碍物是否侵入机器人矩形 ----
-                    # 跳过第0步（当前位姿附近），避免已贴墙状态锁死所有轨迹
-                    min_side_clearance = float('inf')  # 单独追踪侧面距离，用于侧向避障评分
+                    # ---- 矩形碰撞检测 ----
+                    min_side_clearance = float('inf')
+                    side_collision = False     # 侧面贴近标记（连续墙壁稀疏采样）
+                    SIDE_WINDOW = 600          # 侧面检测的扩展前向窗口
                     for step_i, (tx, ty, ttheta) in enumerate(traj_states):
                         if step_i == 0:
-                            continue  # 给机器人 0.1s 时间离开当前危险位置
+                            continue
                         cos_t = math.cos(ttheta)
                         sin_t = math.sin(ttheta)
                         for ob_wx, ob_wy in obs_world:
-                            # 将障碍物变换到该轨迹步的机器人局部坐标系
                             dx_w = ob_wx - tx
                             dy_w = ob_wy - ty
-                            dx_local = dx_w * cos_t + dy_w * sin_t    # 前向分量
-                            dy_local = -dx_w * sin_t + dy_w * cos_t   # 侧向分量
+                            dx_local = dx_w * cos_t + dy_w * sin_t
+                            dy_local = -dx_w * sin_t + dy_w * cos_t
 
-                            # ★ 先计算距离指标（在碰撞判断之前），确保所有轨迹都有有效值
-                            # 侧面距离：无论前向多远，侧面贴近就要惩罚
+                            # 侧面距离（碰撞判断前计算，确保所有障碍物都计入）
                             side_margin = abs(dy_local) - dyn_half_wid
                             min_side_clearance = min(min_side_clearance, side_margin)
-                            # 矩形距离：用 max 保持前向区分度
+                            # 矩形距离
                             dist_to_rect = max(
                                 abs(dx_local) - dyn_half_len,
                                 abs(dy_local) - dyn_half_wid,
                             )
                             min_clearance = min(min_clearance, dist_to_rect)
 
+                            # 标准碰撞：前后+侧面都在边界内
                             if abs(dx_local) < dyn_half_len and abs(dy_local) < dyn_half_wid:
                                 collision = True
                                 break
+                            # 侧面贴近：dy 在边界内 + dx 在扩展窗口内（捕获连续墙壁稀疏采样）
+                            if abs(dy_local) < dyn_half_wid and abs(dx_local) < SIDE_WINDOW:
+                                side_collision = True
                         if collision:
                             break
 
                     if collision:
-                        min_clearance = -999.0  # 碰撞标记：极低综合间距
-                        # ★ min_side_clearance 保留实际值，用于区分贴墙程度
+                        min_clearance = -999.0
+                    elif side_collision:
+                        min_clearance = min(min_clearance, -80.0)  # 侧贴惩罚
 
                     final_x, final_y = traj_states[-1][0], traj_states[-1][1]
                     final_theta = traj_states[-1][2]
@@ -867,6 +871,7 @@ class Navigator:
                         'goal_dist': goal_dist,
                         'clearance': min_clearance,
                         'side_clearance': min_side_clearance,
+                        'side_collision': side_collision,
                         'speed': speed,
                         'path_dev': path_dev,
                         'path_dir_score': path_dir_score,
@@ -979,13 +984,18 @@ class Navigator:
             effective_clearance = max(0.0, effective_clearance)
             clearance_score = effective_clearance ** 2
 
-            # ★ 侧面障碍物折扣：贴墙轨迹的 clearance 得分打折扣
-            # 侧面侵入越深，折扣越大 → DWA 倾向于远离墙壁的轨迹
+            # ★ 侧面障碍物惩罚：直接扣总分，远离墙壁的轨迹更有优势
             side_cl = c['side_clearance']
-            if side_cl < 0:
-                # side_cl=-100 → factor=0.5; side_cl=-200 → factor=0.1(下限)
-                side_factor = max(0.1, 1.0 + side_cl / 200.0)
-                clearance_score *= side_factor
+            if c.get('side_collision', False):
+                side_penalty = 0.30   # 侧面连续贴近：重罚
+            elif side_cl < -150:
+                side_penalty = 0.22
+            elif side_cl < -50:
+                side_penalty = 0.14
+            elif side_cl < 0:
+                side_penalty = 0.06
+            else:
+                side_penalty = 0.0
 
             velocity_score = c['speed'] / max_speed
             path_score = 1.0 - c['path_dev'] / max_path
@@ -1008,7 +1018,7 @@ class Navigator:
                 regression_score * weights['regression'] +
                 smooth_score * weights['smooth'] +
                 rotation_score * weights['rotation']
-            )
+            ) - side_penalty  # 侧面贴近直接扣总分
 
             if score > best_score:
                 best_score = score
@@ -1039,11 +1049,14 @@ class Navigator:
                 # 回归 vw：朝向投影点方向（而不是路径切线方向），确保真正"拉回"路径
                 reg_vw = self.KP_W * math.atan2(reg_dy, reg_dx)
 
-                # ---- 改进：增强回归修正力度，防止偏离过大撞墙 ----
-                # 混合比例：偏离 30mm→8%, 100mm→30%, 200mm→60%, 280mm→75%(上限)
-                blend = min(0.75, max(0.08, (current_path_dev - 30) / 350.0))
-                # 全向底盘：vw混合强度增强，确保方向也回归路径
-                vw_blend = blend * 0.4
+                # ---- 路径回归混合比例 ----
+                # 紧急模式：偏离时更强回归，让 DWA 只做微调不主导方向
+                if emergency:
+                    # 紧急模式：路径回归主导，DWA 仅微调方向
+                    blend = min(0.92, max(0.30, (current_path_dev - 10) / 150.0))
+                else:
+                    blend = min(0.75, max(0.08, (current_path_dev - 30) / 350.0))
+                vw_blend = blend * 0.5
 
                 vx = vx * (1.0 - blend) + reg_vx * blend
                 vy = vy * (1.0 - blend) + reg_vy * blend
@@ -1053,6 +1066,13 @@ class Navigator:
                 vx = max(-self.MAX_VX, min(self.MAX_VX, vx))
                 vy = max(-self.MAX_VY, min(self.MAX_VY, vy))
                 vw = max(-self.MAX_VW, min(self.MAX_VW, vw))
+
+                # 紧急模式：修正后速度不超过纯追踪参考的 2 倍，防止 DWA 远超纯追踪
+                if emergency:
+                    max_vx_ref = max(abs(base_vx) * 2.0, 30.0)
+                    max_vy_ref = max(abs(base_vy) * 2.0, 30.0)
+                    vx = max(-max_vx_ref, min(max_vx_ref, vx))
+                    vy = max(-max_vy_ref, min(max_vy_ref, vy))
 
                 if blend > 0.15:
                     print(f"[DWA-CORRECT] 偏离={current_path_dev:.0f}mm "
@@ -2105,15 +2125,15 @@ class Navigator:
                     continue
 
                 occ_penalty = 0.0
-                for ox in range(-8, 9):
-                    for oy in range(-8, 9):
+                for ox in range(-4, 5):
+                    for oy in range(-4, 5):
                         if in_bounds(nx + ox, ny + oy):
                             if inflated[ny + oy, nx + ox]:
                                 dist = math.hypot(ox, oy)
                                 if dist < 0.01:
                                     penalty = 6.0
                                 else:
-                                    penalty = 3.5 / (dist + 0.5)
+                                    penalty = 2.0 / (dist + 0.5)
                                 occ_penalty += penalty
 
                 tentative = g_score[cy, cx] + cost + occ_penalty

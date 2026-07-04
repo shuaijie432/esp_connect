@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSplitter, QLineEdit
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint, QRect
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject  , QPoint, QRect
 from PyQt5.QtGui import QFont
 
 from lidar_parser import parse_frame
@@ -34,7 +34,7 @@ MQTT_USER = "esp_send"
 MQTT_PASS = "00000000"
 TOPIC_LIDAR = "esp/f79541/data"
 TOPIC_CONTROL = "device/f79541/data"
-TOPIC_OPENMV  = "openmv111/nav"
+TOPIC_OPENMV  = "openmv/nav"
 TOPIC_OPENMV_RECV = "openmv/data"      # 接收 OpenMV 发来的数据
 
 
@@ -304,9 +304,9 @@ class MainWindow(QMainWindow):
         self.start_navigation()
 
     def _on_nav_zero_trigger(self):
-        """MQTT "0" 触发导航 → (400, -1450) @ -90°"""
-        print("[NAV_ZERO] 触发导航 -> (400, -1450) @ -90°")
-        self.target_x.setText("370")
+        """MQTT "0" 触发导航 → (350, -1450) @ -90°"""
+        print("[NAV_ZERO] 触发导航 -> (350, -1450) @ -90°")
+        self.target_x.setText("350")
         self.target_y.setText("-1500")
         self.target_theta_deg.setText("-90")
         self._is_java_nav = True  # 标记：对齐完成后不发 OpenMV
@@ -314,9 +314,9 @@ class MainWindow(QMainWindow):
 
     def _on_ws_cmd_5(self):
         """前端 WebSocket 发送 "5" → 触发导航（帧数>30后由前端确认启动）"""
-        print("[WS_CMD_5] 前端触发 → 导航至 (450, -60) @ 0°")
-        self.target_x.setText("450")
-        self.target_y.setText("-60")
+        print("[WS_CMD_5] 前端触发 → 导航至 (400, -90) @ 0°")
+        self.target_x.setText("400")
+        self.target_y.setText("-90")
         self.target_theta_deg.setText("0")
         self.navigator._nav_count = 0  # 确保作为首次导航，走起点保护流程
         self.start_navigation()

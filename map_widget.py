@@ -39,7 +39,7 @@ class MapWidget(QWidget):
 
         # ===== 叠加图片（世界坐标 mm，可自行调整）====
         self._overlay_pixmap = QPixmap("2.jpg")
-        self.overlay_img_center = (500, -500)       # 图片中心位置 (世界坐标 mm)
+        self.overlay_img_center = (475, -475)       # 图片中心位置 (世界坐标 mm)
         self.overlay_img_size_mm = (350, 350)  # 图片显示大小 (宽, 高) mm
 
         self._overlay_pixmap2 = QPixmap("3.jpg")
@@ -222,10 +222,12 @@ class MapWidget(QWidget):
     def _draw_combined(self, painter, w, h):
         # 1. 栅格地图底图
         self._draw_gridmap_aligned(painter, w, h)
-        # 2. 永久障碍物（亮红色半透明方块）
-        self._draw_permanent_obstacles(painter, w, h)
+        # 2. 永久障碍物（黑色方块）
+        # self._draw_permanent_obstacles(painter, w, h)
+        # 2.5 临时障碍物（黑色半透明方块）
+        self._draw_temporary_obstacles(painter, w, h)
         # # 3. 膨胀障碍物（半透明红色）
-        # self._draw_inflated_grid(painter, w, h)
+        self._draw_inflated_grid(painter, w, h)
         # 4. 坐标轴和网格
         self._draw_axes_and_grid(painter, w, h)
         # 5. 历史点云
@@ -256,13 +258,13 @@ class MapWidget(QWidget):
     # 永久障碍物绘制
     # ============================================================
     def _draw_permanent_obstacles(self, painter, w, h):
-        """绘制被永久固化的障碍物（亮红色半透明方块）"""
+        """绘制被永久固化的障碍物（黑色方块）"""
         if not self.navigator:
             return
         cells = self.navigator.get_stable_obstacle_cells()
         if not cells:
             return
-        painter.setBrush(QColor(255, 50, 50, 150)) # 亮红色半透明
+        painter.setBrush(QColor(0, 0, 0, 200)) # 黑色
         painter.setPen(Qt.NoPen)
         res = self.mapper.map.resolution
         size_px = max(2, int(res * self.scale)) # 栅格在屏幕上的像素大小
@@ -270,6 +272,22 @@ class MapWidget(QWidget):
             wx, wy = self.mapper.map.map_to_world(mx, my)
             sx, sy = self.world_to_screen(wx, wy, w, h)
             # 绘制矩形块（以栅格中心对齐）
+            painter.drawRect(sx - size_px//2, sy - size_px//2, size_px, size_px)
+
+    def _draw_temporary_obstacles(self, painter, w, h):
+        """绘制未固化的临时障碍物（黑色半透明方块）"""
+        if not self.navigator:
+            return
+        cells = self.navigator.get_temporary_obstacle_cells()
+        if not cells:
+            return
+        painter.setBrush(QColor(0, 0, 0, 120)) # 黑色半透明
+        painter.setPen(Qt.NoPen)
+        res = self.mapper.map.resolution
+        size_px = max(2, int(res * self.scale))
+        for mx, my in cells:
+            wx, wy = self.mapper.map.map_to_world(mx, my)
+            sx, sy = self.world_to_screen(wx, wy, w, h)
             painter.drawRect(sx - size_px//2, sy - size_px//2, size_px, size_px)
 
     # ============================================================
