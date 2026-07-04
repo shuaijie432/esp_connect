@@ -32,7 +32,7 @@ class Navigator:
         self.robot_width_mm = 250.0           # 27cm 车身宽度
         self.robot_length_mm = 250.0          # 27cm 车身长度
         self.robot_radius_mm = self.robot_width_mm / 2.0   # 125mm
-        self.safety_margin_mm = 110.0          # DWA 安全余量（不变）
+        self.safety_margin_mm = 130.0          # DWA 安全余量（不变）
         self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 235mm
 
         # A* 栅格膨胀：每个栅格 15mm，16 次膨胀 ≈ 240mm
@@ -42,7 +42,7 @@ class Navigator:
         # ★ 最小可通过通道参数（硬编码，独立于膨胀半径）
         #   最小通道直径 = robot_width_mm + 2 * channel_margin_mm
         #   修改这个值影响 DWA 碰撞框 / 红色虚线圆 / 路径堵塞检测
-        self.channel_margin_mm = 100.0
+        self.channel_margin_mm = 130.0
         self.replan_threshold = 200.0
 
         self.replan_interval = 1.0
@@ -174,14 +174,18 @@ class Navigator:
         for wx, wy in world_pts:
             dist = math.hypot(wx - robot_x, wy - robot_y)
             # 忽略自身附近和太远的点，防止雷达噪声和远距离误检
-            if dist < 80 or dist > 8000:
+            if dist < 20 or dist > 8000:
                 continue
 
             mx, my = grid.world_to_map(wx, wy)
             if 0 <= mx < size and 0 <= my < size:
-                # 不再额外膨胀：全局 obstacle_margin 已经做了统一膨胀，
-                # 这里只标记单栅格，避免双重膨胀把通道堵死。
-                occ_mask[my, mx] = True
+                # 填充 3×3 区域（~45mm），填补雷达点之间的间隙
+                # 确保 A* 看到的障碍物是连续的，不会从缝隙中穿过
+                for dx in range(-1, 2):
+                    for dy in range(-1, 2):
+                        nx, ny = mx + dx, my + dy
+                        if 0 <= nx < size and 0 <= ny < size:
+                            occ_mask[ny, nx] = True
         return occ_mask
 
     # ------------------------------------------------------------
@@ -548,7 +552,7 @@ class Navigator:
             dx = wx - robot_x
             dy = wy - robot_y
             dist = math.hypot(dx, dy)
-            if dist > 1500 or dist < 80:
+            if dist > 1500 or dist < 20:
                 continue
             key = (round(wx / 50.0), round(wy / 50.0))
             current_keys.add(key)
@@ -598,6 +602,52 @@ class Navigator:
             tracked_added.add(key)
             self._local_obstacles.append((local_x, local_y, dist))
 
+        # ---- 将静态地图障碍物加入 DWA 碰撞检测 ----
+        # 让 DWA 知道静态地图中障碍物的位置，即使雷达暂时扫不到
+        static_occ = grid.log_odds > grid.occ_thresh
+        static_added = set()
+        for key in tracked_added:
+            static_added.add(key)
+        for key in current_keys:
+            static_added.add(key)
+
+        # 计算需要查询的地图范围（局部代价地图范围 + 500mm 富余）
+        search_radius_mm = half * res + 500  # ~1100mm
+        search_cells = int(search_radius_mm / grid.resolution) + 1
+        rx_map, ry_map = grid.world_to_map(robot_x, robot_y)
+
+        my_start = max(0, ry_map - search_cells)
+        my_end = min(grid.size, ry_map + search_cells + 1)
+        mx_start = max(0, rx_map - search_cells)
+        mx_end = min(grid.size, rx_map + search_cells + 1)
+
+        for my in range(my_start, my_end):
+            for mx in range(mx_start, mx_end):
+                if not static_occ[my, mx]:
+                    continue
+                wx, wy = grid.map_to_world(mx, my)
+                dx = wx - robot_x
+                dy = wy - robot_y
+                dist = math.hypot(dx, dy)
+                if dist > 2000:
+                    continue
+                # 去重：雷达/追踪障碍物已覆盖的格子跳过
+                key = (round(wx / 50.0), round(wy / 50.0))
+                if key in static_added:
+                    continue
+                static_added.add(key)
+
+                local_x = dx * math.cos(robot_theta) + dy * math.sin(robot_theta)
+                local_y = -dx * math.sin(robot_theta) + dy * math.cos(robot_theta)
+                self._local_obstacles.append((local_x, local_y, dist))
+
+                # 静态地图障碍物代价中等（置信度 70%，低于实时雷达点）
+                lx = int(local_x / res + half)
+                ly = int(local_y / res + half)
+                if 0 <= lx < size and 0 <= ly < size:
+                    cost = min(100.0, 3000.0 / max(dist, 50)) * 0.7
+                    self._local_costmap[ly, lx] = max(self._local_costmap[ly, lx], cost)
+
         self._inflate_local_costmap()
         self._local_costmap_center = (robot_x, robot_y)
         self._local_costmap_valid = True
@@ -630,6 +680,17 @@ class Navigator:
     # ============================================================
     def _dynamic_window_avoidance(self, x, y, theta, base_vx, base_vy, base_vw, emergency=False) -> Tuple[float, float, float]:
         self._update_local_costmap(x, y, theta)
+
+        # 诊断：打印 DWA 感知到的障碍物数量
+        n_obs = len(self._local_obstacles)
+        if n_obs > 0:
+            nearest = min(d for _, _, d in self._local_obstacles)
+        else:
+            nearest = float('inf')
+        if n_obs == 0 or nearest < 300:
+            print(f"[DWA-DIAG] 障碍物数={n_obs} 最近={nearest:.0f}mm "
+                  f"base=({base_vx:.0f},{base_vy:.0f},{math.degrees(base_vw):.1f}°/s) "
+                  f"emergency={emergency}")
 
         # ---- 1. 动态窗口：根据当前速度和加速度限制计算可达速度范围 ----
         dt = 0.3  # 控制周期 100ms
@@ -788,29 +849,33 @@ class Navigator:
                             dx_local = dx_w * cos_t + dy_w * sin_t
                             dy_local = -dx_w * sin_t + dy_w * cos_t
 
+                            # 障碍物点膨胀半径：填充稀疏雷达点之间的间隙
+                            # 每个雷达点视为半径60mm的圆形障碍物，防止机器人从边缘蹭过
+                            OBS_INFLATE = 60.0
+
                             # 侧面距离（碰撞判断前计算，确保所有障碍物都计入）
-                            side_margin = abs(dy_local) - dyn_half_wid
+                            side_margin = abs(dy_local) - dyn_half_wid - OBS_INFLATE
                             min_side_clearance = min(min_side_clearance, side_margin)
-                            # 矩形距离
+                            # 矩形距离（减去障碍物膨胀半径）
                             dist_to_rect = max(
                                 abs(dx_local) - dyn_half_len,
                                 abs(dy_local) - dyn_half_wid,
-                            )
+                            ) - OBS_INFLATE
                             min_clearance = min(min_clearance, dist_to_rect)
 
-                            # 标准碰撞：前后+侧面都在边界内
-                            if abs(dx_local) < dyn_half_len and abs(dy_local) < dyn_half_wid:
+                            # 标准碰撞：前后+侧面都在边界内（含障碍物膨胀）
+                            if abs(dx_local) < dyn_half_len + OBS_INFLATE and abs(dy_local) < dyn_half_wid + OBS_INFLATE:
                                 collision = True
                                 break
                             # 侧面贴近：dy 在边界内 + dx 在扩展窗口内（捕获连续墙壁稀疏采样）
-                            if abs(dy_local) < dyn_half_wid and abs(dx_local) < SIDE_WINDOW:
+                            if abs(dy_local) < dyn_half_wid + OBS_INFLATE and abs(dx_local) < SIDE_WINDOW:
                                 side_collision = True
                         if collision:
                             break
 
                     if collision:
-                        min_clearance = -999.0
-                    elif side_collision:
+                        continue  # 丢弃会碰撞的轨迹，不参与评分
+                    if side_collision:
                         min_clearance = min(min_clearance, -80.0)  # 侧贴惩罚
 
                     final_x, final_y = traj_states[-1][0], traj_states[-1][1]
@@ -892,17 +957,15 @@ class Navigator:
         max_path = max(c['path_dev'] for c in candidates) + 1e-6
         max_smooth = max(c['smooth'] for c in candidates) + 1e-6
         max_abs_vw = max(abs(c['vw']) for c in candidates) + 1e-6
-        # clearance 用 min-max 归一化：兼容 min/max dist_to_rect 下的全负数场景
-        # 0 = 最危险（clearance 最小），1 = 最安全（clearance 最大）
-        clearance_vals = [c['clearance'] for c in candidates]
-        min_cl = min(clearance_vals)
-        max_cl = max(clearance_vals)
-        cl_range = max_cl - min_cl + 1e-6
+        # ---- 绝对距离评分：不再用 min-max 归一化 ----
+        # 改用指数衰减，离障碍物越近分数越低，产生持续排斥力
+        # safe_ref = 350mm：小于此距离时分数显著下降
+        safe_ref = 350.0
 
         # ================================================================
-        # 权重哲学：全局路径 = 大方向把控（~65%），DWA = 微调避障（~15%）
-        #   path+vel_path+turn_toward → 紧贴全局路径点
-        #   clearance → 根据障碍物远近微调，不主导方向
+        # 权重哲学：安全距离内 clearance 主导，安全距离外路径主导
+        #   障碍物近 → clearance 权重飙升，远离障碍物优先
+        #   障碍物远 → path 权重主导，沿全局路径前进优先
         # ================================================================
         dev = current_path_dev
 
@@ -960,7 +1023,39 @@ class Navigator:
         weights['path'] = base_weights['path'] * path_boost
         weights['vel_path'] = base_weights['vel_path'] * vel_path_boost
         weights['turn_toward'] = base_weights['turn_toward'] * turn_toward_boost
-        weights['clearance'] = base_weights['clearance'] * (1.2 if spacious else 2.5)
+
+        # ---- 障碍物自适应：近时抑制路径引力，给 DWA 绕行自主权 ----
+        #   远离障碍物 → 紧跟全局路径
+        #   靠近障碍物 → 放开路径约束，让 DWA 自由绕行
+        #   绕过后 → 路径引力恢复，自动回归全局路径
+        if nearest_obs < 250:
+            # 极近：完全放开路径约束，DWA 全权绕行
+            weights['regression'] *= 0.0
+            weights['path'] *= 0.2
+            weights['vel_path'] *= 0.2
+            weights['turn_toward'] *= 0.1
+            clearance_boost = 8.0
+        elif nearest_obs < 300:
+            # 很近：大幅削弱路径引力
+            weights['regression'] *= 0.15
+            weights['path'] *= 0.35
+            weights['vel_path'] *= 0.35
+            weights['turn_toward'] *= 0.2
+            clearance_boost = 5.0
+        elif nearest_obs < 350:
+            # 较近：部分削弱
+            weights['regression'] *= 0.4
+            weights['path'] *= 0.6
+            weights['vel_path'] *= 0.6
+            weights['turn_toward'] *= 0.5
+            clearance_boost = 3.0
+        elif nearest_obs < 400:
+            # 中等距离：轻微调整
+            clearance_boost = 1.8
+        else:
+            # 安全距离：正常权重
+            clearance_boost = 1.0
+        weights['clearance'] = base_weights['clearance'] * clearance_boost
 
         # 归一化权重（确保总和为 1.0）
         total_w = sum(weights.values())
@@ -976,19 +1071,23 @@ class Navigator:
             path_dev_penalty = max(0.0, 1.0 - c['path_dev'] / 350.0)
             heading_score = raw_heading * path_dev_penalty
 
-            # 转弯侧向保护：低间距+快转弯时等效间距打折，惩罚车尾甩到障碍物
-            # min-max 归一化：0=最危险, 1=最安全（兼容全负数 clearance）
-            raw_clearance = (c['clearance'] - min_cl) / cl_range
-            turn_rate = abs(c['vw'])
-            # 转弯越快，"有效间距"越小（模拟车尾甩动需要的额外空间）
-            effective_clearance = raw_clearance - turn_rate / max(self.MAX_VW, 0.01) * 0.35
-            effective_clearance = max(0.0, effective_clearance)
-            clearance_score = effective_clearance ** 2
+            # 绝对距离评分：clearance 越小，指数级惩罚越大
+            # clearance=50→0.02, 100→0.08, 200→0.26, 350→0.63, 500→0.86
+            if c['clearance'] < 0:
+                clearance_score = 0.01  # 侧面贴墙：极低分
+            else:
+                raw_clearance = 1.0 - math.exp(-c['clearance'] / safe_ref)
+                turn_rate = abs(c['vw'])
+                # 转弯越快，等效间距打折（模拟车尾甩动）
+                effective_clearance = max(0.0, raw_clearance - turn_rate / max(self.MAX_VW, 0.01) * 0.25)
+                clearance_score = effective_clearance ** 2  # 平方加大梯度
 
-            # ★ 侧面障碍物惩罚：直接扣总分，远离墙壁的轨迹更有优势
+            # ★ 侧面障碍物惩罚：按侵入深度比例扣分，贴得越近扣得越重
             side_cl = c['side_clearance']
             if c.get('side_collision', False):
-                side_penalty = 0.30   # 侧面连续贴近：重罚
+                # 侧面贴近：侵入越深惩罚越大（0.20 ~ 0.60）
+                overlap_ratio = min(1.0, abs(min(side_cl, 0)) / 250.0)
+                side_penalty = 0.20 + overlap_ratio * 0.40
             elif side_cl < -150:
                 side_penalty = 0.22
             elif side_cl < -50:
@@ -1027,10 +1126,18 @@ class Navigator:
 
         vx, vy, vw = best_vx, best_vy, best_vw
 
-        # ---- 6. 后置路径修正混合：按偏离程度，将 DWA 输出向全局路径投影点拉回 ----
-        # 核心思想：DWA 可以自主绕行避障，但必须保持向全局路径回归的趋势。
-        # 偏离越大，全局路径的"引力"越强。偏离 > 200mm 时拉回比例可达 70%。
-        if current_path_dev > 30 and self.waypoints and self.current_wp < len(self.waypoints):
+        # ---- 安全停车：最近障碍物 < 50mm 时紧急制动，防止碰撞 ----
+        if nearest_obs < 50:
+            print(f"[DWA-STOP] 障碍物极近({nearest_obs:.0f}mm)，紧急制动！")
+            return 0.0, 0.0, 0.0
+
+        # ---- 6. 后置路径修正混合：障碍物近时抑制，避免拉回撞墙 ----
+        # 障碍物 < 400mm 时跳过路径回归，让 DWA 绕行输出不受干扰
+        # 障碍物远时正常回归，保持全局路径跟踪
+        if nearest_obs < 400:
+            # 障碍物很近：跳过路径修正，完全信任 DWA 的绕行决策
+            pass
+        elif current_path_dev > 30 and self.waypoints and self.current_wp < len(self.waypoints):
             # 用路径投影点作为引力目标
             proj_x, proj_y = current_proj
             reg_dx = proj_x - x
@@ -1051,12 +1158,16 @@ class Navigator:
                 reg_vw = self.KP_W * math.atan2(reg_dy, reg_dx)
 
                 # ---- 路径回归混合比例 ----
-                # 紧急模式：偏离时更强回归，让 DWA 只做微调不主导方向
-                if emergency:
-                    # 紧急模式：路径回归主导，DWA 仅微调方向
-                    blend = min(0.92, max(0.30, (current_path_dev - 10) / 150.0))
+                # 障碍物中等距离时降低回归比例
+                if nearest_obs < 700:
+                    blend_scale = (nearest_obs - 400) / 300.0  # 400→0, 700→1.0
                 else:
-                    blend = min(0.75, max(0.08, (current_path_dev - 30) / 350.0))
+                    blend_scale = 1.0
+
+                if emergency:
+                    blend = min(0.92, max(0.30, (current_path_dev - 10) / 150.0)) * blend_scale
+                else:
+                    blend = min(0.75, max(0.08, (current_path_dev - 30) / 350.0)) * blend_scale
                 vw_blend = blend * 0.5
 
                 vx = vx * (1.0 - blend) + reg_vx * blend
@@ -1272,7 +1383,7 @@ class Navigator:
         return lateral
 
     def check_path_blocked(self) -> bool:
-        """检查前方路径点是否被障碍物阻挡（用当前地图+实时点云+追踪障碍物，不用冻结快照）。
+        """检查前方路径点是否被障碍物阻挡（用当前地图+实时点云+追踪障碍物+DWA局部障碍物）。
         返回 True 表示路径被阻挡，需要重规划。"""
         if not self.waypoints or self.current_wp >= len(self.waypoints):
             return False
@@ -1280,13 +1391,17 @@ class Navigator:
         # 用当前实时地图 + 实时点云判断
         static_occ = grid.log_odds > grid.occ_thresh
         _, world_pts = self.mapper.get_latest_points()
-        # 快速构建实时点云占用掩码（只检查路径点附近）
+        # 快速构建实时点云占用掩码（填充 3×3 消除间隙）
         pc_occ = set()
         if world_pts:
             for wx, wy in world_pts:
                 mx, my = grid.world_to_map(wx, wy)
                 if 0 <= mx < grid.size and 0 <= my < grid.size:
-                    pc_occ.add((mx, my))
+                    for dx in range(-1, 2):
+                        for dy in range(-1, 2):
+                            nx, ny = mx + dx, my + dy
+                            if 0 <= nx < grid.size and 0 <= ny < grid.size:
+                                pc_occ.add((nx, ny))
 
         # 追踪中的障碍物栅格（含未固化的）
         tracked_occ = set()
@@ -1295,16 +1410,32 @@ class Navigator:
                 if 0 <= mx < grid.size and 0 <= my < grid.size:
                     tracked_occ.add((mx, my))
 
-        # 检查接下来的 3 个路径点（余量由 channel_margin_mm 决定）
-        margin = int(round(self.channel_margin_mm / grid.resolution))
-        for i in range(self.current_wp, min(self.current_wp + 3, len(self.waypoints))):
+        # DWA 局部障碍物（短期记忆 + 追踪障碍物）：也纳入检查
+        dwa_occ = set()
+        for local_x, local_y, dist in self._local_obstacles:
+            if dist > 1500:
+                continue
+            # local_obstacles 存储的是局部坐标，需要转回世界坐标
+            # 这里直接用 robot pose 反算（近似）
+            robot_x = self.mapper.pose.x
+            robot_y = self.mapper.pose.y
+            robot_theta = self.mapper.pose.theta
+            wx = robot_x + local_x * math.cos(robot_theta) - local_y * math.sin(robot_theta)
+            wy = robot_y + local_x * math.sin(robot_theta) + local_y * math.cos(robot_theta)
+            mx, my = grid.world_to_map(wx, wy)
+            if 0 <= mx < grid.size and 0 <= my < grid.size:
+                dwa_occ.add((mx, my))
+
+        # 检查接下来的 5 个路径点（加大余量为 2x channel_margin）
+        margin = int(round(self.channel_margin_mm * 2.0 / grid.resolution))
+        for i in range(self.current_wp, min(self.current_wp + 5, len(self.waypoints))):
             wx, wy = self.waypoints[i]
             mx, my = grid.world_to_map(wx, wy)
             for dx in range(-margin, margin + 1):
                 for dy in range(-margin, margin + 1):
                     nx, ny = mx + dx, my + dy
                     if 0 <= nx < grid.size and 0 <= ny < grid.size:
-                        if static_occ[ny, nx] or (nx, ny) in pc_occ or (nx, ny) in tracked_occ:
+                        if static_occ[ny, nx] or (nx, ny) in pc_occ or (nx, ny) in tracked_occ or (nx, ny) in dwa_occ:
                             return True
         return False
 
@@ -1317,7 +1448,7 @@ class Navigator:
             dx = wx - x
             dy = wy - y
             dist = math.hypot(dx, dy)
-            if dist > 2000 or dist < 100:
+            if dist > 2000 or dist < 20:
                 continue
             angle = self._normalize_angle(math.atan2(dy, dx) - theta)
             # 扩大到 ±70°，确保能检测到正前方障碍物
@@ -1444,7 +1575,7 @@ class Navigator:
         abs_diff = abs(angle_diff)
         now = time.time()
 
-        if abs_diff >= math.radians(3.0):
+        if abs_diff >= math.radians(10.0):
             self._align_settle_until = 0.0
             self._alignment_ack_sent = False
             self._align_stable_count = 0
@@ -1790,11 +1921,11 @@ class Navigator:
                 # ±135° ~ ±180° 为正后方
                 rear_min = min(rear_min, dist)
 
-        # 四周统一：200mm 紧急（立即避障），400mm 内进入 CAUTION 准备避让
+        # 提前触发：300mm 紧急（立即避障），500mm 内进入 CAUTION 准备避让
         # ★ 侧面和后方也检查 EMERGENCY，防止机器人平行于墙壁时蹭墙
-        if front_min < 200 or left_min < 200 or right_min < 200:
+        if front_min < 300 or left_min < 300 or right_min < 300:
             return "EMERGENCY"
-        if front_min < 400 or left_min < 400 or right_min < 400 or rear_min < 400:
+        if front_min < 500 or left_min < 500 or right_min < 500 or rear_min < 500:
             return "CAUTION"
 
         return "CLEAR"
@@ -1877,11 +2008,11 @@ class Navigator:
             for priority_offset in [0, 15, -15, 30, -30, 45, -45, 60, -60, 75, -75, 90, -90, 120, -120]:
                 test_dirs.append(self._normalize_angle(path_dir + math.radians(priority_offset)))
 
-        # 检查前方多个距离点，近距离即可，不要要求700mm都clear（窄通道做不到）
-        check_dists = [150, 300, 500]
-        # 安全半径：使用矩形对角线半长 + 安全余量，确保角落也不会蹭到
-        half_diag_phys = math.hypot(self.robot_length_mm / 2.0, self.robot_width_mm / 2.0)  # ≈230mm
-        safe_radius = half_diag_phys + self.safety_margin_mm + self.safety_boost
+        # 检查前方多个距离点，近距离即可
+        check_dists = [200, 400]
+        # 用物理对角线半长（不含安全余量），方向检查宽松些，精细避障交给 DWA
+        half_diag_phys = math.hypot(self.robot_length_mm / 2.0, self.robot_width_mm / 2.0)  # ≈180mm
+        safe_radius = half_diag_phys + 30  # 只加 30mm 缓冲，不过度保守
 
         for test_rad in test_dirs:
             safe = True
@@ -1943,9 +2074,9 @@ class Navigator:
             print(f"[EVADE] 选择方向={math.degrees(best_dir):.0f}° vx={vx:.0f} vy={vy:.0f}")
             return vx, vy, vw
 
-        # 所有方向都不安全，慢速后退作为最后手段
-        print("[EVADE] 所有方向受阻，慢速后退")
-        return -50.0, 0.0, 0.0
+        # 所有方向都不安全：回退到 DWA 紧急模式，让它用路径引导来绕行
+        print("[EVADE] 所有方向受阻，回退到 DWA 路径引导绕行")
+        return 0.0, 0.0, 0.0  # 返回零速度触发 DWA fallback
 
     def get_status(self) -> str:
         if self.state == "IDLE":
