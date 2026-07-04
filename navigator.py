@@ -349,7 +349,7 @@ class Navigator:
         for obs_id, obs_data in self._stable_obstacles.items():
             if not obs_data.get('is_permanent', False):
                 # 未固化障碍物保留 30 秒，给足够时间累积多次观测
-                if current_time - obs_data['last_update'] > 10.0:
+                if current_time - obs_data['last_update'] > 20.0:
                     expired_ids.append(obs_id)
             else:
                 # 已固化障碍物保留 120 秒，消失后自然过期
@@ -359,6 +359,19 @@ class Navigator:
         for obs_id in expired_ids:
             del self._stable_obstacles[obs_id]
             print(f"[OBSTACLE_TRACK] 障碍物 #{obs_id} 已过期")
+
+        # ---- 数量上限：防止长期运行中追踪障碍物无限累积 ----
+        MAX_TRACKED = 30
+        if len(self._stable_obstacles) > MAX_TRACKED:
+            # 优先驱逐最旧的非永久障碍物，其次驱逐最旧的永久障碍物
+            sorted_obs = sorted(
+                self._stable_obstacles.items(),
+                key=lambda x: (x[1].get('is_permanent', False), x[1]['last_update'])
+            )
+            to_remove = len(self._stable_obstacles) - MAX_TRACKED
+            for obs_id, _ in sorted_obs[:to_remove]:
+                del self._stable_obstacles[obs_id]
+            print(f"[OBSTACLE_TRACK] 数量上限({MAX_TRACKED})，驱逐 {to_remove} 个旧障碍物")
 
         matched_stable_ids = set()
 
@@ -496,8 +509,9 @@ class Navigator:
 
         self._local_costmap.fill(0.0)
 
-        # 将所有追踪中的障碍物加入局部代价地图
+        # 将所有追踪中的障碍物加入局部代价地图，同时收集 DWA 碰撞检测数据
         # 已固化的 = 高置信度(代价100)，未固化的 = 中置信度(代价50)
+        _tracked_for_dwa = []  # (local_x, local_y, dist, key) 延迟追加到 _local_obstacles
         for obs_id, obs_data in self._stable_obstacles.items():
             is_perm = obs_data.get('is_permanent', False)
             cost = 100.0 if is_perm else 50.0
@@ -505,12 +519,18 @@ class Navigator:
                 wx, wy = grid.map_to_world(mx, my)
                 dx = wx - robot_x
                 dy = wy - robot_y
+                dist = math.hypot(dx, dy)
                 local_x = dx * math.cos(robot_theta) + dy * math.sin(robot_theta)
                 local_y = -dx * math.sin(robot_theta) + dy * math.cos(robot_theta)
+                # 代价地图
                 lx = int(local_x / res + half)
                 ly = int(local_y / res + half)
                 if 0 <= lx < size and 0 <= ly < size:
                     self._local_costmap[ly, lx] = max(self._local_costmap[ly, lx], cost)
+                # 收集 DWA 碰撞检测数据（延迟去重追加）
+                if dist <= 2000:
+                    key = (round(wx / 50.0), round(wy / 50.0))
+                    _tracked_for_dwa.append((local_x, local_y, dist, key))
 
         _, world_pts = self.mapper.get_latest_points()
         self._local_obstacles = []
@@ -556,13 +576,22 @@ class Navigator:
                 # 记忆点随年龄衰减：0~TTL 秒内线性降到 0.3
                 confidence = max(0.3, 1.0 - age / self._local_obstacle_memory_ttl)
 
-            self._local_obstacles.append((local_x, local_y, dist * (2.0 - confidence)))
+            self._local_obstacles.append((local_x, local_y, dist))
 
             lx = int(local_x / res + half)
             ly = int(local_y / res + half)
             if 0 <= lx < size and 0 <= ly < size:
                 cost = min(100.0, 5000.0 / max(dist, 50)) * confidence
                 self._local_costmap[ly, lx] = max(self._local_costmap[ly, lx], cost)
+
+        # ---- 将追踪障碍物追加到 DWA 碰撞检测列表（去重，利用第一遍已收集的数据） ----
+        # 雷达暂时扫不到已固化的障碍物时，DWA 仍能"记住"它们的位置
+        tracked_added = set()
+        for local_x, local_y, dist, key in _tracked_for_dwa:
+            if key in current_keys or key in tracked_added:
+                continue
+            tracked_added.add(key)
+            self._local_obstacles.append((local_x, local_y, dist))
 
         self._inflate_local_costmap()
         self._local_costmap_center = (robot_x, robot_y)
@@ -663,8 +692,11 @@ class Navigator:
             else:
                 vw_samples = np.linspace(vs[4], vs[5], 5)
         else:
-            vx_samples = np.linspace(vs[0], vs[1], 7)
-            vy_samples = np.linspace(vs[2], vs[3], 5)  # 正常场景 5 个 vy 采样，充分探索
+            # ---- 改进：限制宽敞环境下的前向加速度，防止突然加速 ----
+            # vy 不限制采样上限：侧面避障需要充分的侧向速度探索空间
+            max_vx_sample = min(self.MAX_VX, base_vx * 1.5 + 30)
+            vx_samples = np.linspace(vs[0], max_vx_sample, 7)
+            vy_samples = np.linspace(vs[2], vs[3], 5)  # 全范围 vy 采样，确保侧向逃离能力
             if path_dir_valid and abs(angle_to_path_at_robot) > math.radians(10):
                 mid_vw = (vs[4] + vs[5]) / 2.0
                 if path_on_left:
@@ -738,6 +770,7 @@ class Navigator:
 
                     # ---- 矩形碰撞检测：轨迹上每个位姿检查障碍物是否侵入机器人矩形 ----
                     # 方案B调整：跳过第0步（当前位姿附近），避免已贴墙状态锁死所有轨迹
+                    min_side_clearance = float('inf')  # 单独追踪侧面距离，用于侧向避障评分
                     for step_i, (tx, ty, ttheta) in enumerate(traj_states):
                         if step_i == 0:
                             continue  # 给机器人 0.1s 时间离开当前危险位置
@@ -759,11 +792,15 @@ class Navigator:
                                 abs(dy_local) - dyn_half_wid,
                             )
                             min_clearance = min(min_clearance, dist_to_rect)
+                            # 单独追踪侧面距离：无论前向多远，侧面贴近也要惩罚
+                            side_margin = abs(dy_local) - dyn_half_wid
+                            min_side_clearance = min(min_side_clearance, side_margin)
                         if collision:
                             break
 
                     if collision:
                         min_clearance = -999.0  # 碰撞轨迹不丢弃，但给极低间距分
+                        min_side_clearance = -999.0
 
                     final_x, final_y = traj_states[-1][0], traj_states[-1][1]
                     final_theta = traj_states[-1][2]
@@ -823,6 +860,7 @@ class Navigator:
                         'vx': cvx, 'vy': cvy, 'vw': cvw,
                         'goal_dist': goal_dist,
                         'clearance': min_clearance,
+                        'side_clearance': min_side_clearance,
                         'speed': speed,
                         'path_dev': path_dev,
                         'path_dir_score': path_dir_score,
@@ -838,13 +876,16 @@ class Navigator:
 
         # ---- 5. 归一化 + 加权代价评估 ----
         max_goal = max(c['goal_dist'] for c in candidates) + 1e-6
-        max_clearance = max(c['clearance'] for c in candidates) + 1e-6
         max_speed = max(c['speed'] for c in candidates) + 1e-6
         max_path = max(c['path_dev'] for c in candidates) + 1e-6
         max_smooth = max(c['smooth'] for c in candidates) + 1e-6
         max_abs_vw = max(abs(c['vw']) for c in candidates) + 1e-6
-        # path_dir_score 已在 [0,1]，无需额外归一化
-        # regression 已在 [-1,1]，无需额外归一化
+        # clearance 用 min-max 归一化：兼容 min/max dist_to_rect 下的全负数场景
+        # 0 = 最危险（clearance 最小），1 = 最安全（clearance 最大）
+        clearance_vals = [c['clearance'] for c in candidates]
+        min_cl = min(clearance_vals)
+        max_cl = max(clearance_vals)
+        cl_range = max_cl - min_cl + 1e-6
 
         # ================================================================
         # 权重哲学：全局路径 = 大方向把控（~65%），DWA = 微调避障（~15%）
@@ -859,55 +900,55 @@ class Navigator:
         # 全向底盘：heading对齐(path_dir/turn_toward)权重大幅降低，
         # 到达目标(heading)和路径贴近(path)是核心目标
         if front_dist < 300:
-            base_weights = {'heading': 0.28, 'clearance': 0.08, 'velocity': 0.03,
-                            'path': 0.35, 'path_dir': 0.02, 'vel_path': 0.08,
+            base_weights = {'heading': 0.20, 'clearance': 0.25, 'velocity': 0.03,
+                            'path': 0.24, 'path_dir': 0.02, 'vel_path': 0.06,
                             'turn_toward': 0.03, 'regression': 0.10,
                             'smooth': 0.02, 'rotation': 0.01}
         elif emergency:
-            base_weights = {'heading': 0.10, 'clearance': 0.30, 'velocity': 0.05,
-                            'path': 0.15, 'path_dir': 0.02, 'vel_path': 0.10,
-                            'turn_toward': 0.04, 'regression': 0.20,
+            base_weights = {'heading': 0.08, 'clearance': 0.38, 'velocity': 0.04,
+                            'path': 0.12, 'path_dir': 0.02, 'vel_path': 0.06,
+                            'turn_toward': 0.04, 'regression': 0.15,
                             'smooth': 0.03, 'rotation': 0.01}
         elif tight_space:
-            base_weights = {'heading': 0.15, 'clearance': 0.18, 'velocity': 0.06,
-                            'path': 0.27, 'path_dir': 0.02, 'vel_path': 0.10,
-                            'turn_toward': 0.04, 'regression': 0.15,
+            base_weights = {'heading': 0.12, 'clearance': 0.28, 'velocity': 0.05,
+                            'path': 0.22, 'path_dir': 0.02, 'vel_path': 0.08,
+                            'turn_toward': 0.04, 'regression': 0.12,
                             'smooth': 0.02, 'rotation': 0.01}
         else:
-            base_weights = {'heading': 0.15, 'clearance': 0.15, 'velocity': 0.08,
-                            'path': 0.30, 'path_dir': 0.02, 'vel_path': 0.10,
-                            'turn_toward': 0.03, 'regression': 0.12,
-                            'smooth': 0.04, 'rotation': 0.01}
+            # 宽敞环境：clearance 保持足够权重，确保遇到障碍物时能及时反应
+            base_weights = {'heading': 0.12, 'clearance': 0.20, 'velocity': 0.06,
+                            'path': 0.26, 'path_dir': 0.04, 'vel_path': 0.10,
+                            'turn_toward': 0.04, 'regression': 0.08,
+                            'smooth': 0.03, 'rotation': 0.01}
 
-        # 全向底盘：降低vel_path和turn_toward的放大倍数，
-        # 重点靠regression和path把机器人拉回全局路径
+        # ---- 路径偏离越大，回归引力越强；但限制上限防止碾压避障 ----
         if spacious:
             if dev < 80:
                 regression_boost = 0.3; path_boost = 0.8
-                vel_path_boost = 1.0; turn_toward_boost = 0.5
+                vel_path_boost = 0.8; turn_toward_boost = 0.6
             elif dev < 200:
-                regression_boost = 1.0; path_boost = 1.2
-                vel_path_boost = 1.0; turn_toward_boost = 0.5
+                regression_boost = 0.8; path_boost = 1.0
+                vel_path_boost = 1.0; turn_toward_boost = 0.7
             else:
-                regression_boost = 2.5; path_boost = 2.0
-                vel_path_boost = 1.0; turn_toward_boost = 0.5
+                regression_boost = 1.5; path_boost = 1.5
+                vel_path_boost = 1.2; turn_toward_boost = 0.8
         else:
             if dev < 80:
                 regression_boost = 0.5; path_boost = 1.0
-                vel_path_boost = 1.0; turn_toward_boost = 0.5
+                vel_path_boost = 0.8; turn_toward_boost = 0.6
             elif dev < 200:
-                regression_boost = 1.5; path_boost = 1.3
-                vel_path_boost = 1.0; turn_toward_boost = 0.5
+                regression_boost = 1.0; path_boost = 1.2
+                vel_path_boost = 1.0; turn_toward_boost = 0.7
             else:
-                regression_boost = 2.5; path_boost = 1.8
-                vel_path_boost = 1.0; turn_toward_boost = 0.5
+                regression_boost = 1.5; path_boost = 1.5
+                vel_path_boost = 1.2; turn_toward_boost = 0.8
 
         weights = dict(base_weights)
         weights['regression'] = base_weights['regression'] * regression_boost
         weights['path'] = base_weights['path'] * path_boost
         weights['vel_path'] = base_weights['vel_path'] * vel_path_boost
         weights['turn_toward'] = base_weights['turn_toward'] * turn_toward_boost
-        weights['clearance'] = base_weights['clearance'] * (1.0 if spacious else 1.8)
+        weights['clearance'] = base_weights['clearance'] * (1.2 if spacious else 2.5)
 
         # 归一化权重（确保总和为 1.0）
         total_w = sum(weights.values())
@@ -924,12 +965,21 @@ class Navigator:
             heading_score = raw_heading * path_dev_penalty
 
             # 转弯侧向保护：低间距+快转弯时等效间距打折，惩罚车尾甩到障碍物
-            raw_clearance = c['clearance'] / max_clearance
+            # min-max 归一化：0=最危险, 1=最安全（兼容全负数 clearance）
+            raw_clearance = (c['clearance'] - min_cl) / cl_range
             turn_rate = abs(c['vw'])
             # 转弯越快，"有效间距"越小（模拟车尾甩动需要的额外空间）
             effective_clearance = raw_clearance - turn_rate / max(self.MAX_VW, 0.01) * 0.35
             effective_clearance = max(0.0, effective_clearance)
             clearance_score = effective_clearance ** 2
+
+            # ★ 侧面障碍物折扣：贴墙轨迹的 clearance 得分打折扣
+            # 侧面侵入越深，折扣越大 → DWA 倾向于远离墙壁的轨迹
+            side_cl = c['side_clearance']
+            if side_cl < 0:
+                # side_cl=-100 → factor=0.5; side_cl=-200 → factor=0.1(下限)
+                side_factor = max(0.1, 1.0 + side_cl / 200.0)
+                clearance_score *= side_factor
 
             velocity_score = c['speed'] / max_speed
             path_score = 1.0 - c['path_dev'] / max_path
@@ -983,10 +1033,11 @@ class Navigator:
                 # 回归 vw：朝向投影点方向（而不是路径切线方向），确保真正"拉回"路径
                 reg_vw = self.KP_W * math.atan2(reg_dy, reg_dx)
 
-                # 混合比例：偏离 30mm→5%, 100mm→25%, 200mm→57%, 240mm→70%(上限)
-                blend = min(0.70, max(0.05, (current_path_dev - 30) / 300.0))
-                # 全向底盘：vw混合强度大幅降低，回归主要靠vx/vy平移
-                vw_blend = blend * 0.2
+                # ---- 改进：增强回归修正力度，防止偏离过大撞墙 ----
+                # 混合比例：偏离 30mm→8%, 100mm→30%, 200mm→60%, 280mm→75%(上限)
+                blend = min(0.75, max(0.08, (current_path_dev - 30) / 350.0))
+                # 全向底盘：vw混合强度增强，确保方向也回归路径
+                vw_blend = blend * 0.4
 
                 vx = vx * (1.0 - blend) + reg_vx * blend
                 vy = vy * (1.0 - blend) + reg_vy * blend
@@ -1005,8 +1056,26 @@ class Navigator:
 
         # ---- 7. 硬边界限速（安全兜底，全向底盘允许后退） ----
         vx = max(-self.MAX_VX, min(self.MAX_VX, vx))
-        vy = max(-self.MAX_VY, min(self.MAX_VY, vy))
+        # 改进：侧向速度限制更严格，防止撞墙
+        vy = max(-self.MAX_VY, min(self.MAX_VY * 0.7, vy))
         vw = max(-self.MAX_VW, min(self.MAX_VW, vw))
+
+        # ---- 改进：速度平滑，防止突然加速 ----
+        if not hasattr(self, '_last_dwa_vx'):
+            self._last_dwa_vx = base_vx
+            self._last_dwa_vy = base_vy
+            self._last_dwa_vw = base_vw
+
+        # 低通滤波：α=0.6 表示新值占60%，旧值占40%
+        alpha = 0.6
+        vx = alpha * vx + (1 - alpha) * self._last_dwa_vx
+        vy = alpha * vy + (1 - alpha) * self._last_dwa_vy
+        vw = alpha * vw + (1 - alpha) * self._last_dwa_vw
+
+        # 更新历史值
+        self._last_dwa_vx = vx
+        self._last_dwa_vy = vy
+        self._last_dwa_vw = vw
 
         if abs(vx - base_vx) > 10 or abs(vy - base_vy) > 10 or abs(vw - base_vw) > 0.05:
             # 计算所选轨迹的路径方向对齐度用于调试
@@ -1136,10 +1205,20 @@ class Navigator:
 
         # 局部规划：导航期间始终使用 DWA 进行实时避障
         if self._dw_enabled:
-            emergency = (obstacle_level == "EMERGENCY")
-            vx, vy, vw = self._dynamic_window_avoidance(x, y, theta, base_vx, base_vy, base_vw, emergency=emergency)
-            if emergency:
+            if obstacle_level == "EMERGENCY":
+                # 紧急避障：优先使用专门的避障函数，直接搜索安全方向
+                vx, vy, vw = self._evade_obstacle(x, y, theta)
                 self.state = "EVADE_EMERGENCY"
+                # 如果避障函数返回零速度（无点云数据），回退到 DWA 紧急模式
+                if vx == 0.0 and vy == 0.0 and vw == 0.0:
+                    vx, vy, vw = self._dynamic_window_avoidance(
+                        x, y, theta, base_vx, base_vy, base_vw, emergency=True)
+            else:
+                emergency = (obstacle_level == "CAUTION")
+                vx, vy, vw = self._dynamic_window_avoidance(
+                    x, y, theta, base_vx, base_vy, base_vw, emergency=emergency)
+                if obstacle_level == "CAUTION":
+                    self.state = "AVOIDING"
             # DWA 返回后退速度时，检查是否是过度保守
             # 全向底盘允许后退：只在 DWA 明显过度保守时才回退
             # 条件：pure pursuit 强烈想前进(base_vx>50) 且 前方空间充裕(front_dist>500)
@@ -1252,7 +1331,7 @@ class Navigator:
         self._send_alignment_ack = False
         self._align_stable_count = 0
 
-        # 跳过启动对齐，直接进入路径跟踪
+        # 全向底盘：跳过启动对齐，直接进入路径跟踪
         self._startup_align_phase = 2
         self._startup_align_stable = 0
 
@@ -1683,8 +1762,9 @@ class Navigator:
                 # ±135° ~ ±180° 为正后方
                 rear_min = min(rear_min, dist)
 
-        # 四周统一：200mm 紧急（立即避障），400mm 内就进入 CAUTION 准备避让
-        if front_min < 200:
+        # 四周统一：200mm 紧急（立即避障），400mm 内进入 CAUTION 准备避让
+        # ★ 侧面和后方也检查 EMERGENCY，防止机器人平行于墙壁时蹭墙
+        if front_min < 200 or left_min < 200 or right_min < 200:
             return "EMERGENCY"
         if front_min < 400 or left_min < 400 or right_min < 400 or rear_min < 400:
             return "CAUTION"
@@ -1728,8 +1808,20 @@ class Navigator:
             elif -110 < angle_deg <= -60:
                 right_min = min(right_min, dist)
 
-        # 如果前方还有足够空间（600mm+），不需要紧急接管，回到路径跟踪
+        # 如果前方还有足够空间（600mm+），检查侧面是否需要避让
         if front_min > 600 and fleft_min > 500 and fright_min > 500:
+            # 侧面有近距离障碍物：向远离障碍物方向侧移
+            if left_min < 350:
+                # 左侧有障碍物，向右前方移动
+                side_speed = min(100.0, max(40.0, (350.0 - left_min) * 0.5))
+                print(f"[EVADE] 左侧障碍物 {left_min:.0f}mm，向右避让 vy={side_speed:.0f}")
+                return 80.0, -side_speed, 0.0
+            if right_min < 350:
+                # 右侧有障碍物，向左前方移动
+                side_speed = min(100.0, max(40.0, (350.0 - right_min) * 0.5))
+                print(f"[EVADE] 右侧障碍物 {right_min:.0f}mm，向左避让 vy={side_speed:.0f}")
+                return 80.0, side_speed, 0.0
+            # 前方和侧面都宽敞，回到路径跟踪
             base_vx, base_vy, base_vw = self._pure_pursuit_step(x, y, theta)
             return base_vx * 0.3, base_vy * 0.3, base_vw * 0.3
 
@@ -1744,6 +1836,14 @@ class Navigator:
         if front_min < 300:
             # 极近时优先侧向：先路径侧向，再斜向，最后正前
             for priority_offset in [90, -90, 75, -75, 60, -60, 45, -45, 30, -30, 15, -15, 0, 120, -120]:
+                test_dirs.append(self._normalize_angle(path_dir + math.radians(priority_offset)))
+        elif right_min < 350:
+            # 右侧有障碍物：优先向左（正角度偏移）搜索
+            for priority_offset in [90, 75, 60, 45, 30, 15, 0, -15, -30, -45, -60, -75, -90, 120, -120]:
+                test_dirs.append(self._normalize_angle(path_dir + math.radians(priority_offset)))
+        elif left_min < 350:
+            # 左侧有障碍物：优先向右（负角度偏移）搜索
+            for priority_offset in [-90, -75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75, 90, 120, -120]:
                 test_dirs.append(self._normalize_angle(path_dir + math.radians(priority_offset)))
         else:
             for priority_offset in [0, 15, -15, 30, -30, 45, -45, 60, -60, 75, -75, 90, -90, 120, -120]:
@@ -1785,6 +1885,15 @@ class Navigator:
             elif front_min < 450:
                 if abs(math.sin(test_rad)) > 0.5:
                     score += 30
+            # 侧面有障碍物时，奖励远离障碍物方向
+            if right_min < 350:
+                # 右侧障碍物：奖励向左(正 vy)的方向
+                if math.sin(test_rad) > 0:
+                    score += (350.0 - right_min) * 0.3
+            if left_min < 350:
+                # 左侧障碍物：奖励向右(负 vy)的方向
+                if math.sin(test_rad) < 0:
+                    score += (350.0 - left_min) * 0.3
 
             if score > best_score:
                 best_score = score

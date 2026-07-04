@@ -34,7 +34,7 @@ MQTT_USER = "esp_send"
 MQTT_PASS = "00000000"
 TOPIC_LIDAR = "esp/f79541/data"
 TOPIC_CONTROL = "device/f79541/data"
-TOPIC_OPENMV  = "openmv/nav"
+TOPIC_OPENMV  = "openmv111/nav"
 TOPIC_OPENMV_RECV = "openmv/data"      # 接收 OpenMV 发来的数据
 
 
@@ -277,6 +277,7 @@ class MainWindow(QMainWindow):
         self._hold_timer.start(100)
 
         self._need_replan = False
+        self._last_replan_time = 0.0     # 重规划冷却，避免频繁解冻地图放大漂移
         self._alignment_ack_done = False
         self._pending_obstacles = []
         self._obstacle_processing = False
@@ -714,7 +715,10 @@ class MainWindow(QMainWindow):
 
         if self._need_replan:
             self._need_replan = False
-            if self.navigator.waypoints:
+            # 冷却时间：3 秒内不重复重规划，避免频繁解冻地图放大里程计漂移
+            if now - self._last_replan_time < 3.0:
+                pass  # 跳过，等冷却
+            elif self.navigator.waypoints:
                 target = self.navigator.waypoints[-1]
                 target_theta = self.navigator.target_theta
                 old_state = self.navigator.state
@@ -722,6 +726,7 @@ class MainWindow(QMainWindow):
 
                 success = self.navigator.set_target(target[0], target[1], target_theta)
                 if success:
+                    self._last_replan_time = now
                     self.navigator.current_wp = min(old_wp, len(self.navigator.waypoints) - 1)
                     self.set_status("检测到新障碍物，已重新规划路径", "orange")
                     print(f"[REPLAN] 恢复路径点 {self.navigator.current_wp}/{len(self.navigator.waypoints)}")
