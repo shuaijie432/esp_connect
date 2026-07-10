@@ -32,10 +32,11 @@ class Navigator:
         self.robot_width_mm = 250.0           # 27cm 车身宽度
         self.robot_length_mm = 250.0          # 27cm 车身长度
         self.robot_radius_mm = self.robot_width_mm / 2.0   # 125mm
-        self.safety_margin_mm = 50.0           # 小地图窄道：400mm走廊中 robot(250)+2*50=350 < 400
+        self.safety_margin_mm = 50.0           # DWA 额外安全余量
         self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 175mm
 
-        # A* 栅格膨胀：每格10mm，3次膨胀=30mm，总膨胀=125+30=155mm，在400mm走廊中可通行
+        # A* 膨胀 = total_inflation / resolution = 175/10 ≈ 18 格
+        # 保证机器人中心离障碍物至少 180mm，DWA 有足够空间执行
         self.obstacle_margin = 6
 
         # ★ 最小可通过通道参数（硬编码，独立于膨胀半径）
@@ -106,10 +107,10 @@ class Navigator:
         # 动态窗口避障参数
         self._dw_enabled = True
         # 四周统一安全距离：车头/车尾/侧方都使用同样的阈值
-        self._uniform_clearance = 150.0   # 小地图降低安全余量
-        self._dw_safe_distance = 100.0    # 前方100mm开始减速
-        self._dw_critical_distance = 70.0  # 前方70mm停止
-        self._dw_lateral_gain = 1.7
+        self._uniform_clearance = 200.0   # DWA安全余量 mm（提高：150→200）
+        self._dw_safe_distance = 150.0    # 前方150mm开始减速（提高：100→150）
+        self._dw_critical_distance = 100.0  # 前方100mm停止（提高：70→100）
+        self._dw_lateral_gain = 2.0       # 侧向避障增益（提高：1.7→2.0）
 
         # 卡住检测参数（长时间卡住才重规划）
         self._stuck_check_start = 0.0
@@ -944,42 +945,42 @@ class Navigator:
         # 全向底盘：heading对齐(path_dir/turn_toward)权重大幅降低，
         # 到达目标(heading)和路径贴近(path)是核心目标
         if front_dist < 200:
-            base_weights = {'heading': 0.20, 'clearance': 0.25, 'velocity': 0.03,
-                            'path': 0.24, 'path_dir': 0.02, 'vel_path': 0.06,
+            base_weights = {'heading': 0.15, 'clearance': 0.35, 'velocity': 0.02,
+                            'path': 0.20, 'path_dir': 0.02, 'vel_path': 0.05,
                             'turn_toward': 0.03, 'regression': 0.10,
                             'smooth': 0.02, 'rotation': 0.01}
         elif emergency:
-            base_weights = {'heading': 0.08, 'clearance': 0.38, 'velocity': 0.04,
-                            'path': 0.12, 'path_dir': 0.02, 'vel_path': 0.06,
+            base_weights = {'heading': 0.06, 'clearance': 0.45, 'velocity': 0.03,
+                            'path': 0.10, 'path_dir': 0.01, 'vel_path': 0.04,
                             'turn_toward': 0.04, 'regression': 0.15,
                             'smooth': 0.03, 'rotation': 0.01}
         elif tight_space:
-            base_weights = {'heading': 0.12, 'clearance': 0.28, 'velocity': 0.05,
-                            'path': 0.22, 'path_dir': 0.02, 'vel_path': 0.08,
+            base_weights = {'heading': 0.10, 'clearance': 0.35, 'velocity': 0.04,
+                            'path': 0.18, 'path_dir': 0.02, 'vel_path': 0.06,
                             'turn_toward': 0.04, 'regression': 0.12,
                             'smooth': 0.02, 'rotation': 0.01}
         else:
-            # 宽敞环境：clearance 保持足够权重，确保遇到障碍物时能及时反应
-            base_weights = {'heading': 0.12, 'clearance': 0.20, 'velocity': 0.06,
-                            'path': 0.26, 'path_dir': 0.04, 'vel_path': 0.10,
-                            'turn_toward': 0.04, 'regression': 0.08,
+            # 宽敞环境：大幅提高 clearance 权重，确保远离障碍物
+            base_weights = {'heading': 0.10, 'clearance': 0.30, 'velocity': 0.05,
+                            'path': 0.22, 'path_dir': 0.03, 'vel_path': 0.08,
+                            'turn_toward': 0.03, 'regression': 0.08,
                             'smooth': 0.03, 'rotation': 0.01}
 
         # ---- 路径偏离越大，回归引力越强；但限制上限防止碾压避障 ----
         if spacious:
             if dev < 80:
-                regression_boost = 0.3; path_boost = 0.8
-                vel_path_boost = 0.8; turn_toward_boost = 0.6
+                regression_boost = 0.3; path_boost = 0.6
+                vel_path_boost = 0.6; turn_toward_boost = 0.5
             elif dev < 200:
-                regression_boost = 0.8; path_boost = 1.0
-                vel_path_boost = 1.0; turn_toward_boost = 0.7
+                regression_boost = 0.6; path_boost = 0.8
+                vel_path_boost = 0.8; turn_toward_boost = 0.6
             else:
-                regression_boost = 1.5; path_boost = 1.5
-                vel_path_boost = 1.2; turn_toward_boost = 0.8
+                regression_boost = 1.0; path_boost = 1.0
+                vel_path_boost = 1.0; turn_toward_boost = 0.7
         else:
             if dev < 80:
-                regression_boost = 0.5; path_boost = 1.0
-                vel_path_boost = 0.8; turn_toward_boost = 0.6
+                regression_boost = 0.4; path_boost = 0.8
+                vel_path_boost = 0.6; turn_toward_boost = 0.5
             elif dev < 200:
                 regression_boost = 1.0; path_boost = 1.2
                 vel_path_boost = 1.0; turn_toward_boost = 0.7
@@ -1017,16 +1018,16 @@ class Navigator:
             effective_clearance = max(0.0, effective_clearance)
             clearance_score = effective_clearance ** 2
 
-            # ★ 侧面障碍物惩罚：直接扣总分，远离墙壁的轨迹更有优势
+            # ★ 侧面障碍物惩罚：远离墙壁的轨迹大幅奖励
             side_cl = c['side_clearance']
             if c.get('side_collision', False):
-                side_penalty = 0.30   # 侧面连续贴近：重罚
+                side_penalty = 0.50   # 侧面连续贴近：重罚（提高：0.30→0.50）
             elif side_cl < -150:
-                side_penalty = 0.22
+                side_penalty = 0.35
             elif side_cl < -50:
-                side_penalty = 0.14
+                side_penalty = 0.22
             elif side_cl < 0:
-                side_penalty = 0.06
+                side_penalty = 0.10
             else:
                 side_penalty = 0.0
 
