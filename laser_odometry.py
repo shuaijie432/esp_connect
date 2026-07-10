@@ -61,20 +61,20 @@ class LaserOdometry:
         self.wheel_initialized = False
 
         # 运动模型噪声（静止时 noise 小，运动时 noise 大）
-        self.motion_noise_xy_static = 0.5     # 静止时位置噪声 mm（改小）
-        self.motion_noise_theta_static = 0.005  # 静止时角度噪声 rad（改小）
-        self.motion_noise_xy_dynamic = 30.0   # 运动时位置噪声 mm
-        self.motion_noise_theta_dynamic = 0.15 # 运动时角度噪声 rad
+        self.motion_noise_xy_static = 0.5     # 静止时位置噪声 mm
+        self.motion_noise_theta_static = 0.005  # 静止时角度噪声 rad
+        self.motion_noise_xy_dynamic = 10.0   # 运动时位置噪声 mm（降低：30→10，减少漂移）
+        self.motion_noise_theta_dynamic = 0.03 # 运动时角度噪声 rad（降低：0.15→0.05，减少角漂）
 
         # 静止判定阈值：轮式增量小于此值认为是噪声，直接忽略
         self.stationary_dx_threshold = 2.0    # mm
         self.stationary_dy_threshold = 2.0    # mm
         self.stationary_dtheta_threshold = 0.02  # rad (~1.1°)
 
-        # 观测模型参数
-        self.hit_score = 2.0
-        self.miss_penalty = -0.5
-        self.out_penalty = -1.0
+        # 观测模型参数（强化：增大 hit/miss 差距，提高定位校正力）
+        self.hit_score = 4.0      # 命中障碍物得分（提高：2.0→3.0）
+        self.miss_penalty = -1.0  # 落在空闲区扣分（加强：-0.5→-1.0）
+        self.out_penalty = -1.0   # 越界扣分
 
         # 重采样参数
         self.resample_threshold = 0.5  # 有效粒子数占比低于此值时重采样
@@ -121,6 +121,11 @@ class LaserOdometry:
             self.y = odom_y
             self.theta = odom_theta
             return
+
+        # 记录原始轮式里程计（用于漂移监控）
+        self._raw_wheel_x = odom_x
+        self._raw_wheel_y = odom_y
+        self._raw_wheel_theta = odom_theta
 
         self.last_wheel_x = odom_x
         self.last_wheel_y = odom_y
@@ -173,13 +178,33 @@ class LaserOdometry:
         # 7. 静止检测 + 自适应噪声
         self._update_stationary_status()
 
+        # 8. 漂移预警：协方差持续膨胀时发出警告
+        if self.frame_count % 20 == 0 and not self.is_stationary:
+            std_xy = math.hypot(self.pose_std[0], self.pose_std[1])
+            if std_xy > 30 or math.degrees(self.pose_std[2]) > 5:
+                print(f"[PF] ⚠ 位姿协方差膨胀 std_xy={std_xy:.1f}mm "
+                      f"std_θ={math.degrees(self.pose_std[2]):.1f}° "
+                      f"— 定位可能漂移中")
+
         if self.frame_count % 50 == 0:
+            # 漂移监控：比较 PF 估计 vs 原始轮式里程计
+            drift_msg = ""
+            if hasattr(self, '_raw_wheel_x'):
+                raw_dx = self.x - self._raw_wheel_x
+                raw_dy = self.y - self._raw_wheel_y
+                raw_dtheta = math.degrees(self._angle_diff(self.theta, self._raw_wheel_theta))
+                drift_dist = math.hypot(raw_dx, raw_dy)
+                if drift_dist > 50 or abs(raw_dtheta) > 3:
+                    drift_msg = f" ⚠漂移:{drift_dist:.0f}mm/{raw_dtheta:.1f}°"
+                else:
+                    drift_msg = f" ✓漂移:{drift_dist:.0f}mm/{raw_dtheta:.1f}°"
+
             print(f"[PF] 帧:{self.frame_count} 位姿:({self.x:.0f},{self.y:.0f}) "
                   f"θ:{math.degrees(self.theta):.1f}° "
                   f"std:({self.pose_std[0]:.1f},{self.pose_std[1]:.1f},"
                   f"{math.degrees(self.pose_std[2]):.1f}°) "
                   f"Neff:{neff:.0f}/{self.num_particles} "
-                  f"静止:{self.is_stationary}")
+                  f"静止:{self.is_stationary}{drift_msg}")
 
         return True, self.x, self.y, self.theta
 
@@ -210,14 +235,12 @@ class LaserOdometry:
             noise_theta = self.motion_noise_theta_dynamic
 
         for p in self.particles:
-            # 粒子坐标系下的增量 -> 世界坐标
-            cos_t = math.cos(p.theta)
-            sin_t = math.sin(p.theta)
-            world_dx = dx * cos_t - dy * sin_t
-            world_dy = dx * sin_t + dy * cos_t
-
-            p.x += world_dx + np.random.normal(0, noise_xy)
-            p.y += world_dy + np.random.normal(0, noise_xy)
+            # ★ 关键修复：ESP32 发来的 odom.x/odom.y 是绝对世界坐标，
+            # 增量 dx/dy 已经是世界坐标系下的位移，不需要再按粒子朝向旋转。
+            # 之前的 "粒子坐标系→世界坐标" 旋转是错误的 — 每次转弯都会
+            # 让所有粒子朝错误方向移动，导致观测模型无法纠正，快速漂移。
+            p.x += dx + np.random.normal(0, noise_xy)
+            p.y += dy + np.random.normal(0, noise_xy)
             p.theta += dtheta + np.random.normal(0, noise_theta)
 
             # 归一化角度
@@ -258,8 +281,8 @@ class LaserOdometry:
                         score += self.miss_penalty
                     # 未知区域不加分不扣分
 
-            # 权重 = exp(score) 防止负数权重
-            p.weight = math.exp(score * 0.5)
+            # 权重 = exp(score * scale)，scale 越大好坏粒子区分越明显
+            p.weight = math.exp(score * 0.8)  # 提高区分度（0.5→0.8），增强定位校正力
 
     def _normalize_weights(self):
         """归一化粒子权重"""
@@ -308,9 +331,10 @@ class LaserOdometry:
                     new_p.y += np.random.normal(0, 0.3)
                     new_p.theta += np.random.normal(0, 0.001)
                 else:
-                    new_p.x += np.random.normal(0, 10.0)
-                    new_p.y += np.random.normal(0, 10.0)
-                    new_p.theta += np.random.normal(0, 0.03)
+                    # 降低重采样噪声（10.0→4.0mm, 0.03→0.01rad），减少累积漂移
+                    new_p.x += np.random.normal(0, 4.0)
+                    new_p.y += np.random.normal(0, 4.0)
+                    new_p.theta += np.random.normal(0, 0.01)
                 new_particles.append(new_p)
             else:
                 new_particles.append(self.particles[-1].copy())
