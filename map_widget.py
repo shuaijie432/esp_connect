@@ -383,15 +383,15 @@ class MapWidget(QWidget):
         painter.setPen(QColor(200, 200, 200))
         font = QFont("Microsoft YaHei", 8)
         painter.setFont(font)
-        for i in range(0, 8000, 1000):
+        for i in range(0, 2001, 500):
             sy = cy - int(i * self.scale)
             if 0 <= sy <= h:
-                painter.drawText(cx + 5, sy, f"{i//1000}m")
+                painter.drawText(cx + 5, sy, f"{i/10:.0f}cm")
                 painter.drawLine(cx - 3, sy, cx + 3, sy)
-        for i in range(-4000, 4001, 1000):
+        for i in range(-1000, 1001, 500):
             sx = cx - int(i * self.scale)
             if 0 <= sx <= w:
-                painter.drawText(sx, cy + 15, f"{i//1000}m")
+                painter.drawText(sx, cy + 15, f"{i/10:.0f}cm")
                 painter.drawLine(sx, cy - 3, sx, cy + 3)
 
     # ============================================================

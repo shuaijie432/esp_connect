@@ -39,7 +39,7 @@ TOPIC_OPENMV_RECV = "openmv/data"      # 接收 OpenMV 发来的数据
 
 
 MAP_SIZE_MM = 8000
-RESOLUTION_MM = 15
+RESOLUTION_MM = 10
 FRAME_QUEUE_SIZE = 3
 MAP_FILE = "1.png"
 

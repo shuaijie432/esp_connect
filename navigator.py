@@ -19,10 +19,10 @@ class Navigator:
         self.waypoints = []
         self.current_wp = 0
 
-        self.lookahead_min = 600.0
-        self.lookahead_max = 1200.0
-        self.wp_threshold = 120.0
-        self.final_threshold = 60.0
+        self.lookahead_min = 200.0
+        self.lookahead_max = 500.0
+        self.wp_threshold = 60.0
+        self.final_threshold = 40.0
 
         # 机器人物理尺寸（mm）
         # 底盘支持平移过窄道，膨胀基准用车宽/2（直行通过所需最小半宽），
@@ -32,17 +32,16 @@ class Navigator:
         self.robot_width_mm = 250.0           # 27cm 车身宽度
         self.robot_length_mm = 250.0          # 27cm 车身长度
         self.robot_radius_mm = self.robot_width_mm / 2.0   # 125mm
-        self.safety_margin_mm = 110.0          # DWA 安全余量（不变）
-        self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 235mm
+        self.safety_margin_mm = 50.0           # 小地图窄道：400mm走廊中 robot(250)+2*50=350 < 400
+        self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 175mm
 
-        # A* 栅格膨胀：每个栅格 15mm，16 次膨胀 ≈ 240mm
-        # 匹配 total_inflation_mm(235) = robot_radius(125) + safety_margin(110)
-        self.obstacle_margin = 7
+        # A* 栅格膨胀：每格10mm，3次膨胀=30mm，总膨胀=125+30=155mm，在400mm走廊中可通行
+        self.obstacle_margin = 6
 
         # ★ 最小可通过通道参数（硬编码，独立于膨胀半径）
         #   最小通道直径 = robot_width_mm + 2 * channel_margin_mm
         #   修改这个值影响 DWA 碰撞框 / 红色虚线圆 / 路径堵塞检测
-        self.channel_margin_mm = 100.0
+        self.channel_margin_mm = 60.0   # DWA碰撞框半宽=125+60=185mm，400mm走廊中可通行
         self.replan_threshold = 200.0
 
         self.replan_interval = 1.0
@@ -59,6 +58,7 @@ class Navigator:
 
         self._inflated_grid = None
         self._grid_version = -1
+        self._cost_grid = None          # 距离变换代价网格（A* 根据离障碍物距离计算代价）
 
         # 规划时冻结的地图（仅保存静态地图快照，膨胀在调用时动态生成）
         self._planned_grid = None
@@ -66,9 +66,9 @@ class Navigator:
         self._plan_frozen = False
 
         # 速度参数（底盘支持平移）
-        self.MAX_VX = 250.0   # 从 150 降低，窄道中有更多反应时间
-        self.MAX_VY = 100.0   # 降低侧移最大速度，减少侧移使用频率
-        self.MAX_VW = 0.2     # 提高角速度上限，增强转向绕行能力
+        self.MAX_VX = 150.0   # 小地图降速，窄道中留更多反应时间
+        self.MAX_VY = 80.0    # 侧移速度降低
+        self.MAX_VW = 0.4     # 角速度提高，小空间转弯更灵活
         self.KP_V = 0.5
         self.KP_W = 1.4       # 提高角度增益，对方向偏差反应更积极
 
@@ -81,15 +81,18 @@ class Navigator:
         self._align_stable_count = 0
 
         # 障碍物永久融合参数
-        self._min_cluster_size = 3                               # 更小的障碍物也能被追踪
-        self._obstacle_stability_threshold = 250.0               # 100→250，容忍定位漂移
+        self._min_cluster_size = 3                               # 至少3个连成片的栅格才算障碍物（滤除噪点）
+        self._permanent_after_sec = 3.0                          # 连续观测超过3秒 → 写入静态地图
+        self._expire_after_sec = 10.0                            # 超过10秒未扫到 → 从静态地图删除
+        self._obstacle_cost_gain = 8.0                           # A*障碍物距离代价增益：越靠近障碍物代价越高
+        self._obstacle_cost_decay = 8.0                          # A*代价衰减距离（栅格数），超过后代价接近0
         self._obstacle_fusion_interval = 0.5
         self._stable_obstacles = {}
         self._obstacle_id_counter = 0
 
         # 局部代价地图
         self._local_costmap_size = 80
-        self._local_costmap_resolution = 15
+        self._local_costmap_resolution = 10   # 与 RESOLUTION_MM 保持一致
         self._local_costmap = np.zeros((self._local_costmap_size, self._local_costmap_size), dtype=np.float32)
         self._local_obstacles = []
         self._local_costmap_center = (0, 0)
@@ -103,9 +106,9 @@ class Navigator:
         # 动态窗口避障参数
         self._dw_enabled = True
         # 四周统一安全距离：车头/车尾/侧方都使用同样的阈值
-        self._uniform_clearance = 250.0   # 四周统一安全余量 mm
-        self._dw_safe_distance = 180.0    # 前方 150mm 开始减速（给 120mm 留缓冲）
-        self._dw_critical_distance = 140.0  # 前方 120mm 停止
+        self._uniform_clearance = 150.0   # 小地图降低安全余量
+        self._dw_safe_distance = 100.0    # 前方100mm开始减速
+        self._dw_critical_distance = 70.0  # 前方70mm停止
         self._dw_lateral_gain = 1.7
 
         # 卡住检测参数（长时间卡住才重规划）
@@ -247,7 +250,24 @@ class Navigator:
                 if 0 <= nx < grid.size and 0 <= ny < grid.size:
                     inflated[ny, nx] = False
 
+        # 6. 距离变换：计算每个栅格到最近障碍物的欧氏距离（栅格单位）
+        #    用于 A* 代价函数，让路径自然远离障碍物，给 DWA 留出绕行空间
+        try:
+            from scipy.ndimage import distance_transform_edt
+            # distance_transform_edt: 输入 False=障碍物，返回每个点到最近 False 的距离
+            # 用 combined_occ（膨胀前的占用掩码）计算，避免膨胀本身产生的距离偏差
+            self._cost_grid = distance_transform_edt(~combined_occ)
+        except ImportError:
+            self._cost_grid = None
+
         return inflated
+
+    def _get_cost_grid(self):
+        """返回距离变换代价网格，供 A* 使用。
+        每个栅格的值 = 到最近障碍物的栅格距离（欧氏距离）。
+        需要先调用 _get_planning_inflated_grid() 来更新。
+        """
+        return self._cost_grid
 
     # ------------------------------------------------------------
     # 保留原 _precompute_inflation 但规划时不再使用，仅用于兼容
@@ -350,20 +370,23 @@ class Navigator:
         permanent_count = 0
         newly_permanent = 0
 
+        grid = self.mapper.map
         expired_ids = []
         for obs_id, obs_data in self._stable_obstacles.items():
-            if not obs_data.get('is_permanent', False):
-                # 未固化障碍物保留 30 秒，给足够时间累积多次观测
-                if current_time - obs_data['last_update'] > 20.0:
-                    expired_ids.append(obs_id)
-            else:
-                # 已固化障碍物保留 120 秒，消失后自然过期
-                if current_time - obs_data['last_update'] > 120.0:
-                    expired_ids.append(obs_id)
+            if current_time - obs_data['last_update'] > self._expire_after_sec:
+                expired_ids.append(obs_id)
 
         for obs_id in expired_ids:
+            obs_data = self._stable_obstacles[obs_id]
+            if obs_data.get('is_permanent', False):
+                # 已固化的障碍物过期：从静态地图中清除
+                for mx, my in obs_data['cells']:
+                    if 0 <= mx < grid.size and 0 <= my < grid.size:
+                        grid.log_odds[my, mx] = 0.0  # 回到未知状态
+                print(f"[OBSTACLE_TRACK] 障碍物 #{obs_id} 已过期，已从静态地图清除")
+            else:
+                print(f"[OBSTACLE_TRACK] 障碍物 #{obs_id} 已过期（未固化）")
             del self._stable_obstacles[obs_id]
-            print(f"[OBSTACLE_TRACK] 障碍物 #{obs_id} 已过期")
 
         # ---- 数量上限：防止长期运行中追踪障碍物无限累积 ----
         MAX_TRACKED = 30
@@ -375,6 +398,11 @@ class Navigator:
             )
             to_remove = len(self._stable_obstacles) - MAX_TRACKED
             for obs_id, _ in sorted_obs[:to_remove]:
+                obs_data = self._stable_obstacles[obs_id]
+                if obs_data.get('is_permanent', False):
+                    for mx, my in obs_data['cells']:
+                        if 0 <= mx < grid.size and 0 <= my < grid.size:
+                            grid.log_odds[my, mx] = 0.0
                 del self._stable_obstacles[obs_id]
             print(f"[OBSTACLE_TRACK] 数量上限({MAX_TRACKED})，驱逐 {to_remove} 个旧障碍物")
 
@@ -403,35 +431,38 @@ class Navigator:
                 obs_data = self._stable_obstacles[best_match_id]
 
                 if obs_data.get('is_permanent', False):
+                    # 已固化：只需更新时间戳
                     obs_data['last_update'] = current_time
                     matched_stable_ids.add(best_match_id)
                     permanent_count += 1
                     matched = True
 
-                elif best_match_dist < self._obstacle_stability_threshold:
-                    obs_data['is_permanent'] = True
-                    obs_data['fixed_position'] = (new_cx, new_cy)
-                    obs_data['centroid'] = (new_cx, new_cy)
-                    obs_data['cells'] = set(cluster_info['cells'])
-                    obs_data['last_update'] = current_time
-                    matched_stable_ids.add(best_match_id)
-                    stable_count += 1
-                    newly_permanent += 1
-                    matched = True
-                    print(f"[OBSTACLE_TRACK] 障碍物 #{best_match_id} 位置稳定 "
-                          f"({best_match_dist:.0f}mm < {self._obstacle_stability_threshold}mm) "
-                          f"→ 永久固化到地图！")
-
                 else:
+                    # 未固化：更新位置和栅格，检查是否已连续观测超过3秒
                     obs_data['centroid'] = (new_cx, new_cy)
                     obs_data['cells'] = set(cluster_info['cells'])
                     obs_data['last_update'] = current_time
                     matched_stable_ids.add(best_match_id)
                     updated_count += 1
                     matched = True
-                    print(f"[OBSTACLE_TRACK] 障碍物 #{best_match_id} 位置更新 "
-                          f"→ ({new_cx:.0f},{new_cy:.0f}) "
-                          f"距离={best_match_dist:.0f}mm，继续观察")
+
+                    elapsed = current_time - obs_data['first_seen']
+                    if elapsed >= self._permanent_after_sec:
+                        # 连续观测超过3秒 → 永久固化到静态地图
+                        obs_data['is_permanent'] = True
+                        obs_data['fixed_position'] = (new_cx, new_cy)
+                        for mx, my in obs_data['cells']:
+                            if 0 <= mx < grid.size and 0 <= my < grid.size:
+                                grid.log_odds[my, mx] = grid.log_occ  # +6.0 = 占用
+                        stable_count += 1
+                        newly_permanent += 1
+                        print(f"[OBSTACLE_TRACK] 障碍物 #{best_match_id} 连续观测 {elapsed:.1f}s ≥ "
+                              f"{self._permanent_after_sec}s → 已写入静态地图！ "
+                              f"({len(obs_data['cells'])} 栅格)")
+                    else:
+                        print(f"[OBSTACLE_TRACK] 障碍物 #{best_match_id} 位置更新 "
+                              f"({new_cx:.0f},{new_cy:.0f}) "
+                              f"已观测 {elapsed:.1f}s，还需 {self._permanent_after_sec - elapsed:.1f}s 固化")
 
             if not matched:
                 self._obstacle_id_counter += 1
@@ -439,19 +470,19 @@ class Navigator:
                 self._stable_obstacles[new_id] = {
                     'centroid': (new_cx, new_cy),
                     'cells': set(cluster_info['cells']),
+                    'first_seen': current_time,      # 首次观测时间
                     'last_update': current_time,
                     'is_permanent': False,
                     'fixed_position': None
                 }
                 matched_stable_ids.add(new_id)
                 updated_count += 1
-                print(f"[OBSTACLE_TRACK] 新大障碍物 #{new_id} @({new_cx:.0f},{new_cy:.0f}) "
-                      f"大小={cluster_info['size']}栅格({cluster_info['size_mm']:.0f}mm)")
+                print(f"[OBSTACLE_TRACK] 新障碍物 #{new_id} @({new_cx:.0f},{new_cy:.0f}) "
+                      f"大小={cluster_info['size']}栅格({cluster_info['size_mm']:.0f}mm) "
+                      f"→ 开始计时，{self._permanent_after_sec}s后固化")
 
-        # 不再将障碍物写入静态地图。
-        # 跟踪的障碍物（无论是否永久）都通过 _get_planning_inflated_grid()
-        # 和 _update_local_costmap() 动态叠加到规划和避障中，
-        # 障碍物过期后自然消失，不留"幽灵障碍物"。
+        # 跟踪的障碍物动态叠加到规划和避障中（不区分是否永久）
+        # 已永久固化的障碍物已写入 static map，这里再叠加一次确保不遗漏
         all_permanent_cells = set()
         for obs_id, obs_data in self._stable_obstacles.items():
             if obs_data.get('is_permanent', False):
@@ -499,6 +530,7 @@ class Navigator:
     def _clear_dynamic_obstacles(self):
         self._stable_obstacles.clear()
         self._inflated_grid = None
+        self._cost_grid = None
         self._grid_version = -1
         self._unfreeze_planning_map()
         print("[NAV] 所有动态障碍物已清除，规划地图已解冻")
@@ -660,20 +692,20 @@ class Navigator:
             path_on_left = angle_to_path_at_robot > 0  # >0 = 路径在逆时针侧(CCW)
 
         # ---- 检测狭窄程度：自适应调整预测时间和碰撞半径 ----
-        near_obstacles = [d for _, _, d in self._local_obstacles if d < 600]
-        tight_space = len(near_obstacles) > 10
-        very_tight = len([d for _, _, d in self._local_obstacles if d < 350]) > 5
+        near_obstacles = [d for _, _, d in self._local_obstacles if d < 350]
+        tight_space = len(near_obstacles) > 8
+        very_tight = len([d for _, _, d in self._local_obstacles if d < 200]) > 4
 
         # 前方障碍物距离决定预测时间：越近越短，避免所有前进轨迹被判碰撞
         front_dist = self._get_front_distance(x, y, theta)
 
         # ---- 2. 速度空间离散采样 ----
         # vw 完全自由采样，由 DWA 根据障碍物距离自行判断；vw 采样偏向路径方向
-        if front_dist < 300:
+        if front_dist < 200:
             predict_time = 0.15
             time_step = 0.05
-            vx_samples = np.linspace(vs[0], min(vs[1], 40.0), 5)
-            vy_samples = np.linspace(max(vs[2], -20.0), min(vs[3], 20.0), 3)
+            vx_samples = np.linspace(vs[0], min(vs[1], 30.0), 5)
+            vy_samples = np.linspace(max(vs[2], -15.0), min(vs[3], 15.0), 3)
             vw_samples = np.linspace(vs[4], vs[5], 5)
         elif emergency or very_tight:
             vx_samples = np.linspace(vs[0], min(vs[1], 60.0), 7)
@@ -907,11 +939,11 @@ class Navigator:
         dev = current_path_dev
 
         nearest_obs = min([d for _, _, d in self._local_obstacles], default=1500)
-        spacious = nearest_obs > 600
+        spacious = nearest_obs > 400
 
         # 全向底盘：heading对齐(path_dir/turn_toward)权重大幅降低，
         # 到达目标(heading)和路径贴近(path)是核心目标
-        if front_dist < 300:
+        if front_dist < 200:
             base_weights = {'heading': 0.20, 'clearance': 0.25, 'velocity': 0.03,
                             'path': 0.24, 'path_dir': 0.02, 'vel_path': 0.06,
                             'turn_toward': 0.03, 'regression': 0.10,
@@ -1215,18 +1247,18 @@ class Navigator:
         front_dist = self._get_front_distance(x, y, theta)
 
         # 障碍物附近重置卡住计时器：靠近障碍物时移动慢是正常的，不要触发后退振荡
-        if front_dist < 600.0 or obstacle_level != "CLEAR":
+        if front_dist < 400.0 or obstacle_level != "CLEAR":
             self.stuck_timer = now
 
         self.state = "FOLLOWING"
         base_vx, base_vy, base_vw = self._pure_pursuit_step(x, y, theta)
 
-        # 前方障碍物距离越近减速越强：500mm 开始减速，150mm 降到最低
-        if front_dist < 500.0:
-            speed_scale = max(0.15, (front_dist - 150.0) / 350.0)
+        # 前方障碍物距离越近减速越强：250mm 开始减速，80mm 降到最低
+        if front_dist < 250.0:
+            speed_scale = max(0.15, (front_dist - 80.0) / 170.0)
             base_vx = base_vx * speed_scale
             base_vy = base_vy * speed_scale
-            if front_dist < 250.0:
+            if front_dist < 150.0:
                 print(f"[BRAKE] 前方障碍物 {front_dist:.0f}mm，速度缩放至 {speed_scale:.2f}")
 
         # 局部规划：导航期间始终使用 DWA 进行实时避障
@@ -1790,11 +1822,11 @@ class Navigator:
                 # ±135° ~ ±180° 为正后方
                 rear_min = min(rear_min, dist)
 
-        # 四周统一：200mm 紧急（立即避障），400mm 内进入 CAUTION 准备避让
+        # 四周统一：120mm 紧急（立即避障），250mm 内进入 CAUTION 准备避让
         # ★ 侧面和后方也检查 EMERGENCY，防止机器人平行于墙壁时蹭墙
-        if front_min < 200 or left_min < 200 or right_min < 200:
+        if front_min < 120 or left_min < 120 or right_min < 120:
             return "EMERGENCY"
-        if front_min < 400 or left_min < 400 or right_min < 400 or rear_min < 400:
+        if front_min < 250 or left_min < 250 or right_min < 250 or rear_min < 250:
             return "CAUTION"
 
         return "CLEAR"
@@ -1836,19 +1868,19 @@ class Navigator:
             elif -110 < angle_deg <= -60:
                 right_min = min(right_min, dist)
 
-        # 如果前方还有足够空间（600mm+），检查侧面是否需要避让
-        if front_min > 600 and fleft_min > 500 and fright_min > 500:
+        # 如果前方还有足够空间（350mm+），检查侧面是否需要避让
+        if front_min > 350 and fleft_min > 300 and fright_min > 300:
             # 侧面有近距离障碍物：向远离障碍物方向侧移
-            if left_min < 350:
+            if left_min < 200:
                 # 左侧有障碍物，向右前方移动
-                side_speed = min(100.0, max(40.0, (350.0 - left_min) * 0.5))
+                side_speed = min(80.0, max(30.0, (200.0 - left_min) * 0.5))
                 print(f"[EVADE] 左侧障碍物 {left_min:.0f}mm，向右避让 vy={side_speed:.0f}")
-                return 80.0, -side_speed, 0.0
-            if right_min < 350:
+                return 60.0, -side_speed, 0.0
+            if right_min < 200:
                 # 右侧有障碍物，向左前方移动
-                side_speed = min(100.0, max(40.0, (350.0 - right_min) * 0.5))
+                side_speed = min(80.0, max(30.0, (200.0 - right_min) * 0.5))
                 print(f"[EVADE] 右侧障碍物 {right_min:.0f}mm，向左避让 vy={side_speed:.0f}")
-                return 80.0, side_speed, 0.0
+                return 60.0, side_speed, 0.0
             # 前方和侧面都宽敞，回到路径跟踪
             base_vx, base_vy, base_vw = self._pure_pursuit_step(x, y, theta)
             return base_vx * 0.3, base_vy * 0.3, base_vw * 0.3
@@ -1861,15 +1893,15 @@ class Navigator:
         # 优先测试路径方向及附近方向
         # 当已经非常靠近障碍物时，优先搜索侧向方向（左右横移）而不是正前方
         test_dirs = []
-        if front_min < 300:
+        if front_min < 200:
             # 极近时优先侧向：先路径侧向，再斜向，最后正前
             for priority_offset in [90, -90, 75, -75, 60, -60, 45, -45, 30, -30, 15, -15, 0, 120, -120]:
                 test_dirs.append(self._normalize_angle(path_dir + math.radians(priority_offset)))
-        elif right_min < 350:
+        elif right_min < 200:
             # 右侧有障碍物：优先向左（正角度偏移）搜索
             for priority_offset in [90, 75, 60, 45, 30, 15, 0, -15, -30, -45, -60, -75, -90, 120, -120]:
                 test_dirs.append(self._normalize_angle(path_dir + math.radians(priority_offset)))
-        elif left_min < 350:
+        elif left_min < 200:
             # 左侧有障碍物：优先向右（负角度偏移）搜索
             for priority_offset in [-90, -75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75, 90, 120, -120]:
                 test_dirs.append(self._normalize_angle(path_dir + math.radians(priority_offset)))
@@ -1878,9 +1910,9 @@ class Navigator:
                 test_dirs.append(self._normalize_angle(path_dir + math.radians(priority_offset)))
 
         # 检查前方多个距离点，近距离即可，不要要求700mm都clear（窄通道做不到）
-        check_dists = [150, 300, 500]
+        check_dists = [100, 200, 350]
         # 安全半径：使用矩形对角线半长 + 安全余量，确保角落也不会蹭到
-        half_diag_phys = math.hypot(self.robot_length_mm / 2.0, self.robot_width_mm / 2.0)  # ≈230mm
+        half_diag_phys = math.hypot(self.robot_length_mm / 2.0, self.robot_width_mm / 2.0)  # ≈177mm
         safe_radius = half_diag_phys + self.safety_margin_mm + self.safety_boost
 
         for test_rad in test_dirs:
@@ -2048,6 +2080,7 @@ class Navigator:
         print(f"[A*] 终点世界: ({goal[0]:.0f}, {goal[1]:.0f}) -> 地图: ({gx}, {gy})")
 
         inflated = self._get_planning_inflated_grid()
+        cost_grid = self._get_cost_grid()  # 距离变换代价网格
         if inflated is None:
             print("[A*] 错误：无法获取膨胀栅格")
             return []
@@ -2129,17 +2162,14 @@ class Navigator:
                 if inflated[ny, nx]:
                     continue
 
-                occ_penalty = 0.0
-                for ox in range(-4, 5):
-                    for oy in range(-4, 5):
-                        if in_bounds(nx + ox, ny + oy):
-                            if inflated[ny + oy, nx + ox]:
-                                dist = math.hypot(ox, oy)
-                                if dist < 0.01:
-                                    penalty = 6.0
-                                else:
-                                    penalty = 2.0 / (dist + 0.5)
-                                occ_penalty += penalty
+                # 距离变换代价：离障碍物越近，代价越高
+                # cost_grid[ny,nx] = 到最近障碍物的栅格距离（欧氏距离）
+                # 代价公式：gain / (1 + dist/decay)，近处代价高，远处趋近于0
+                if cost_grid is not None:
+                    dist_cells = cost_grid[ny, nx]
+                    occ_penalty = self._obstacle_cost_gain / (1.0 + dist_cells / self._obstacle_cost_decay)
+                else:
+                    occ_penalty = 0.0
 
                 tentative = g_score[cy, cx] + cost + occ_penalty
                 if tentative < g_score[ny, nx]:

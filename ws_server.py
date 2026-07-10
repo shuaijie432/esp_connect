@@ -105,8 +105,8 @@ class WebSocketServer:
 
         # 地图栅格（降采样到 ~200x200）
         map_grid = None
-        map_size_mm = 8000
-        resolution = 15
+        map_size_mm = 2000
+        resolution = 10
         if mapper.map is not None:
             grid = mapper.map.get_display()
             step = max(1, grid.shape[0] // 200)
