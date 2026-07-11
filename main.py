@@ -816,7 +816,7 @@ class MainWindow(QMainWindow):
             if not hasattr(self, '_cmd_cnt'):
                 self._cmd_cnt = 0
             self._cmd_cnt += 1
-            if self._cmd_cnt % 20 == 0:
+            if self._cmd_cnt % 5 == 0:  # 每5帧(0.5s)打印，方便观察DWA避障
                 hex_str = ' '.join(f'{b:02X}' for b in frame)
                 print(f"[CMD] 速度: vx={vx:6.1f} vy={vy:6.1f} vw={math.degrees(vw):5.1f}°/s | HEX[{hex_str}]")
 

@@ -35,14 +35,14 @@ class Navigator:
         self.safety_margin_mm = 50.0           # DWA 额外安全余量
         self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 175mm
 
-        # A* 膨胀 = total_inflation / resolution = 175/10 ≈ 18 格
-        # 保证机器人中心离障碍物至少 180mm，DWA 有足够空间执行
-        self.obstacle_margin = 6
+        # A* 硬膨胀 = total_inflation / resolution = 175/10 ≈ 18 格
+        # 保证重规划路径离障碍物 ≥ 175mm（车身边缘外 50mm 安全间隙）
+        self.obstacle_margin = 12
 
         # ★ 最小可通过通道参数（硬编码，独立于膨胀半径）
         #   最小通道直径 = robot_width_mm + 2 * channel_margin_mm
         #   修改这个值影响 DWA 碰撞框 / 红色虚线圆 / 路径堵塞检测
-        self.channel_margin_mm = 60.0   # DWA碰撞框半宽=125+60=185mm，400mm走廊中可通行
+        self.channel_margin_mm = 80.0   # DWA碰撞框半宽=125+60=185mm，400mm走廊中可通行
         self.replan_threshold = 200.0
 
         self.replan_interval = 1.0
@@ -82,7 +82,7 @@ class Navigator:
         self._align_stable_count = 0
 
         # 障碍物永久融合参数
-        self._min_cluster_size = 3                               # 至少3个连成片的栅格才算障碍物（滤除噪点）
+        self._min_cluster_size = 1                               # 至少3个连成片的栅格才算障碍物（滤除噪点）
         self._permanent_after_sec = 3.0                          # 连续观测超过3秒 → 写入静态地图
         self._expire_after_sec = 10.0                            # 超过10秒未扫到 → 从静态地图删除
         self._obstacle_cost_gain = 8.0                           # A*障碍物距离代价增益：越靠近障碍物代价越高
@@ -380,13 +380,9 @@ class Navigator:
         for obs_id in expired_ids:
             obs_data = self._stable_obstacles[obs_id]
             if obs_data.get('is_permanent', False):
-                # 已固化的障碍物过期：从静态地图中清除
                 for mx, my in obs_data['cells']:
                     if 0 <= mx < grid.size and 0 <= my < grid.size:
-                        grid.log_odds[my, mx] = 0.0  # 回到未知状态
-                print(f"[OBSTACLE_TRACK] 障碍物 #{obs_id} 已过期，已从静态地图清除")
-            else:
-                print(f"[OBSTACLE_TRACK] 障碍物 #{obs_id} 已过期（未固化）")
+                        grid.log_odds[my, mx] = 0.0
             del self._stable_obstacles[obs_id]
 
         # ---- 数量上限：防止长期运行中追踪障碍物无限累积 ----
@@ -405,7 +401,6 @@ class Navigator:
                         if 0 <= mx < grid.size and 0 <= my < grid.size:
                             grid.log_odds[my, mx] = 0.0
                 del self._stable_obstacles[obs_id]
-            print(f"[OBSTACLE_TRACK] 数量上限({MAX_TRACKED})，驱逐 {to_remove} 个旧障碍物")
 
         matched_stable_ids = set()
 
@@ -457,13 +452,8 @@ class Navigator:
                                 grid.log_odds[my, mx] = grid.log_occ  # +6.0 = 占用
                         stable_count += 1
                         newly_permanent += 1
-                        print(f"[OBSTACLE_TRACK] 障碍物 #{best_match_id} 连续观测 {elapsed:.1f}s ≥ "
-                              f"{self._permanent_after_sec}s → 已写入静态地图！ "
-                              f"({len(obs_data['cells'])} 栅格)")
                     else:
-                        print(f"[OBSTACLE_TRACK] 障碍物 #{best_match_id} 位置更新 "
-                              f"({new_cx:.0f},{new_cy:.0f}) "
-                              f"已观测 {elapsed:.1f}s，还需 {self._permanent_after_sec - elapsed:.1f}s 固化")
+                        pass  # 静默
 
             if not matched:
                 self._obstacle_id_counter += 1
@@ -478,9 +468,6 @@ class Navigator:
                 }
                 matched_stable_ids.add(new_id)
                 updated_count += 1
-                print(f"[OBSTACLE_TRACK] 新障碍物 #{new_id} @({new_cx:.0f},{new_cy:.0f}) "
-                      f"大小={cluster_info['size']}栅格({cluster_info['size_mm']:.0f}mm) "
-                      f"→ 开始计时，{self._permanent_after_sec}s后固化")
 
         # 跟踪的障碍物动态叠加到规划和避障中（不区分是否永久）
         # 已永久固化的障碍物已写入 static map，这里再叠加一次确保不遗漏
@@ -491,9 +478,6 @@ class Navigator:
 
         # 标记需要重规划（有新障碍物出现或障碍物状态变化）
         need_replan = (updated_count > 0 or newly_permanent > 0) and self._plan_frozen
-        if need_replan:
-            print(f"[OBSTACLE_TRACK] 障碍物变化(新增/更新={updated_count} "
-                  f"新固化={newly_permanent})，需重规划")
 
         return {
             'added': 0,  # 不再写入静态地图，始终为 0
@@ -1016,18 +1000,18 @@ class Navigator:
             # 转弯越快，"有效间距"越小（模拟车尾甩动需要的额外空间）
             effective_clearance = raw_clearance - turn_rate / max(self.MAX_VW, 0.01) * 0.35
             effective_clearance = max(0.0, effective_clearance)
-            clearance_score = effective_clearance ** 2
+            clearance_score = effective_clearance ** 4  # 四次方：离障碍物距离差异被极度放大
 
-            # ★ 侧面障碍物惩罚：远离墙壁的轨迹大幅奖励
+            # ★ 侧面障碍物惩罚：强力推开，确保侧向远离墙壁
             side_cl = c['side_clearance']
             if c.get('side_collision', False):
-                side_penalty = 0.50   # 侧面连续贴近：重罚（提高：0.30→0.50）
+                side_penalty = 0.60   # 侧面贴墙：极重罚
             elif side_cl < -150:
-                side_penalty = 0.35
+                side_penalty = 0.45
             elif side_cl < -50:
-                side_penalty = 0.22
+                side_penalty = 0.30
             elif side_cl < 0:
-                side_penalty = 0.10
+                side_penalty = 0.15
             else:
                 side_penalty = 0.0
 
@@ -1084,13 +1068,12 @@ class Navigator:
                 reg_vw = self.KP_W * math.atan2(reg_dy, reg_dx)
 
                 # ---- 路径回归混合比例 ----
-                # 紧急模式：偏离时更强回归，让 DWA 只做微调不主导方向
+                # DWA 避障优先，路径回归只做轻量引导，不覆盖避障决策
                 if emergency:
-                    # 紧急模式：路径回归主导，DWA 仅微调方向
-                    blend = min(0.92, max(0.30, (current_path_dev - 10) / 150.0))
+                    blend = min(0.30, max(0.10, (current_path_dev - 50) / 300.0))
                 else:
-                    blend = min(0.75, max(0.08, (current_path_dev - 30) / 350.0))
-                vw_blend = blend * 0.5
+                    blend = min(0.25, max(0.05, (current_path_dev - 50) / 400.0))
+                vw_blend = blend * 0.3
 
                 vx = vx * (1.0 - blend) + reg_vx * blend
                 vy = vy * (1.0 - blend) + reg_vy * blend
@@ -1108,16 +1091,11 @@ class Navigator:
                     vx = max(-max_vx_ref, min(max_vx_ref, vx))
                     vy = max(-max_vy_ref, min(max_vy_ref, vy))
 
-                if blend > 0.15:
-                    print(f"[DWA-CORRECT] 偏离={current_path_dev:.0f}mm "
-                          f"混合={blend:.2f} vw混合={vw_blend:.2f} "
-                          f"DWA=({best_vx:.0f},{best_vy:.0f},{math.degrees(best_vw):.0f}°/s) → "
-                          f"修正=({vx:.0f},{vy:.0f},{math.degrees(vw):.0f}°/s)")
+                # DWA-CORRECT print removed
 
         # ---- 7. 硬边界限速（安全兜底，全向底盘允许后退） ----
         vx = max(-self.MAX_VX, min(self.MAX_VX, vx))
-        # 改进：侧向速度限制更严格，防止撞墙
-        vy = max(-self.MAX_VY, min(self.MAX_VY * 0.7, vy))
+        vy = max(-self.MAX_VY, min(self.MAX_VY, vy))
         vw = max(-self.MAX_VW, min(self.MAX_VW, vw))
 
         # ---- 改进：速度平滑，防止突然加速 ----
@@ -1137,25 +1115,7 @@ class Navigator:
         self._last_dwa_vy = vy
         self._last_dwa_vw = vw
 
-        if abs(vx - base_vx) > 10 or abs(vy - base_vy) > 10 or abs(vw - base_vw) > 0.05:
-            # 计算所选轨迹的路径方向对齐度用于调试
-            sel_path_dir = None
-            sel_regression = None
-            sel_vel_path = None
-            for c in candidates:
-                if c['vx'] == best_vx and c['vy'] == best_vy and c['vw'] == best_vw:
-                    sel_path_dir = c.get('path_dir_score', None)
-                    sel_regression = c.get('regression', None)
-                    sel_vel_path = c.get('vel_path_score', None)
-                    break
-            pd_str = f" 朝向对齐={sel_path_dir:.2f}" if sel_path_dir is not None else ""
-            vp_str = f" 速度对齐={sel_vel_path:.2f}" if sel_vel_path is not None else ""
-            reg_str = f" 回归={sel_regression:+.2f}" if sel_regression is not None else ""
-            dev_str = f" 偏离={current_path_dev:.0f}mm"
-            sp_str = " [宽敞]" if nearest_obs > 600 else f" [狭窄{nearest_obs:.0f}mm]"
-            print(f"[DWA] {'[EMG] ' if emergency else ''}选择 vx={vx:.0f} vy={vy:.0f} vw={math.degrees(vw):.1f}°/s "
-                  f"(原始={base_vx:.0f},{base_vy:.0f}) 评分={best_score:.3f}"
-                  f"{vp_str}{pd_str}{reg_str}{dev_str}{sp_str}")
+        # DWA debug print removed
 
         return vx, vy, vw
 
@@ -1287,8 +1247,6 @@ class Navigator:
                 vx = base_vx * 0.3
                 vy = base_vy * 0.3
                 vw = base_vw * 0.3
-                print(f"[DWA] 回退过度保守(front={front_dist:.0f}mm base_vx={base_vx:.0f})，"
-                      f"使用降速 pure pursuit: vx={vx:.0f}")
         else:
             vx, vy, vw = base_vx, base_vy, base_vw
 
@@ -1466,10 +1424,6 @@ class Navigator:
             self._startup_align_stable = 0
 
         vw = max(-self.MAX_VW, min(self.MAX_VW, self.KP_W * angle_diff))
-        if self._startup_align_stable == 0:
-            print(f"[STARTUP] 原地旋转对齐朝向 "
-                  f"角度差={math.degrees(abs_diff):.1f}° "
-                  f"vw={math.degrees(vw):.1f}°/s (纯旋转, vx=vy=0)")
         return 0.0, 0.0, vw
 
     def _align_heading_step(self, x: float, y: float, theta: float) -> Tuple[float, float, float]:
@@ -1477,7 +1431,7 @@ class Navigator:
         abs_diff = abs(angle_diff)
         now = time.time()
 
-        if abs_diff >= math.radians(3.0):
+        if abs_diff >= math.radians(10.0):
             self._align_settle_until = 0.0
             self._alignment_ack_sent = False
             self._align_stable_count = 0
@@ -1494,10 +1448,6 @@ class Navigator:
 
             vw_raw = align_KP * angle_diff
             vw = max(-vw_cap, min(vw_cap, vw_raw))
-            # 只在有明显角度差时打印，减少日志噪音
-            if abs_diff > math.radians(10.0):
-                print(f"[ALIGN] 角度差={math.degrees(angle_diff):.1f}° "
-                      f"vw={math.degrees(vw):.1f}°/s (cap={math.degrees(vw_cap):.0f}°/s)")
             return 0.0, 0.0, vw
 
         if self._align_stable_count < 3:
