@@ -83,7 +83,7 @@ class Navigator:
 
         # 障碍物永久融合参数
         self._min_cluster_size = 1                               # 至少3个连成片的栅格才算障碍物（滤除噪点）
-        self._permanent_after_sec = 3.0                          # 连续观测超过3秒 → 写入静态地图
+        self._permanent_after_sec = 1.5                          # 连续观测超过1.5秒 → 写入静态地图
         self._expire_after_sec = 10.0                            # 超过10秒未扫到 → 从静态地图删除
         self._obstacle_cost_gain = 8.0                           # A*障碍物距离代价增益：越靠近障碍物代价越高
         self._obstacle_cost_decay = 8.0                          # A*代价衰减距离（栅格数），超过后代价接近0
@@ -114,11 +114,11 @@ class Navigator:
 
         # 卡住检测参数（长时间卡住才重规划）
         self._stuck_check_start = 0.0
-        self._stuck_check_duration = 10.0
+        self._stuck_check_duration = 5.0
         self._stuck_pos_history = deque(maxlen=50)
         self._stuck_dist_threshold = 200.0
         self._total_replan_count = 0
-        self._max_replan = 2
+        self._max_replan = 999
 
         # 起点保护：首次导航先向右上方移动 3 帧，
         # 后续导航先原地旋转对齐朝向，再开始路径跟踪
@@ -1148,6 +1148,7 @@ class Navigator:
                 self.state = "DONE"
                 self.final_approach_dist = 0.0
                 self.safety_boost = 0.0
+                self._nav_start_time = 0.0
                 print("[NAV] 到达目标！")
                 return 0.0, 0.0, 0.0
 
@@ -1250,6 +1251,15 @@ class Navigator:
         else:
             vx, vy, vw = base_vx, base_vy, base_vw
 
+        # 导航起步速度渐变：前2秒内逐步从30%加速到100%
+        if getattr(self, '_nav_start_time', 0) > 0:
+            elapsed = now - self._nav_start_time
+            if elapsed < 2.0:
+                ramp = 0.3 + 0.7 * (elapsed / 2.0)
+                vx *= ramp
+                vy *= ramp
+                vw *= ramp
+
         return vx, vy, vw
 
     def _calc_lateral_error(self, x, y, theta) -> float:
@@ -1340,6 +1350,9 @@ class Navigator:
         self.stuck_timer = time.time()
         self.last_pos = (self.mapper.pose.x, self.mapper.pose.y)
 
+        # 导航起步速度渐变：记录起动时刻，前2秒内逐步放开限速
+        self._nav_start_time = time.time()
+
         self._stuck_check_start = time.time()
         self._stuck_pos_history.clear()
 
@@ -1370,6 +1383,7 @@ class Navigator:
         self._nav_count = 0
         self.final_approach_dist = 0.0
         self.safety_boost = 0.0
+        self._nav_start_time = 0.0
         self._unfreeze_planning_map()
         print("[NAV] 导航已取消，规划地图已解冻")
 
@@ -1588,6 +1602,24 @@ class Navigator:
 
         wx, wy = self.waypoints[self.current_wp]
         dist = math.hypot(wx - x, wy - y)
+
+        # DWA 绕行后机器人可能离当前路径点很远，扫描前方找最近的点
+        if dist > 400:
+            best_idx = self.current_wp
+            best_dist = dist
+            for i in range(self.current_wp + 1, len(self.waypoints)):
+                nx, ny = self.waypoints[i]
+                nd = math.hypot(nx - x, ny - y)
+                if nd < best_dist:
+                    best_dist = nd
+                    best_idx = i
+                if nd > best_dist * 2.0:
+                    break
+            if best_idx > self.current_wp:
+                skipped = best_idx - self.current_wp
+                self.current_wp = best_idx
+                print(f"[NAV] DWA绕行后跳过{skipped}个路径点 -> [{self.current_wp}]")
+                return
 
         if dist > 300 and self.current_wp + 1 < len(self.waypoints):
             nx, ny = self.waypoints[self.current_wp + 1]
@@ -1924,7 +1956,8 @@ class Navigator:
             # 全向底盘允许后退，不再强制截断负vx
             vw = 0.0
             print(f"[EVADE] 选择方向={math.degrees(best_dir):.0f}° vx={vx:.0f} vy={vy:.0f}")
-            return vx, vy, vw
+
+        return vx, vy, vw
 
         # 所有方向都不安全，慢速后退作为最后手段
         print("[EVADE] 所有方向受阻，慢速后退")

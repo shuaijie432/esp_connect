@@ -709,7 +709,7 @@ class MainWindow(QMainWindow):
         now = time.time()
         if not hasattr(self, '_last_path_blocked_check'):
             self._last_path_blocked_check = 0.0
-        if (now - self._last_path_blocked_check > 0.5
+        if (now - self._last_path_blocked_check > 0.2
                 and self.navigator.state == "FOLLOWING"
                 and not self._need_replan):
             self._last_path_blocked_check = now
@@ -720,7 +720,7 @@ class MainWindow(QMainWindow):
         if self._need_replan:
             self._need_replan = False
             # 冷却时间：3 秒内不重复重规划，避免频繁解冻地图放大里程计漂移
-            if now - self._last_replan_time < 3.0:
+            if now - self._last_replan_time < 1.0:
                 pass  # 跳过，等冷却
             elif self.navigator.waypoints:
                 target = self.navigator.waypoints[-1]
@@ -731,9 +731,17 @@ class MainWindow(QMainWindow):
                 success = self.navigator.set_target(target[0], target[1], target_theta)
                 if success:
                     self._last_replan_time = now
-                    self.navigator.current_wp = min(old_wp, len(self.navigator.waypoints) - 1)
+                    rx, ry = self.mapper.pose.x, self.mapper.pose.y
+                    best_idx = 0
+                    best_dist = float('inf')
+                    for i, (wx, wy) in enumerate(self.navigator.waypoints):
+                        d = math.hypot(wx - rx, wy - ry)
+                        if d < best_dist:
+                            best_dist = d
+                            best_idx = i
+                    self.navigator.current_wp = best_idx
                     self.set_status("检测到新障碍物，已重新规划路径", "orange")
-                    print(f"[REPLAN] 恢复路径点 {self.navigator.current_wp}/{len(self.navigator.waypoints)}")
+                    print(f"[REPLAN] 机器人位置({rx:.0f},{ry:.0f})，最近新路径点 {best_idx}/{len(self.navigator.waypoints)} (距离{best_dist:.0f}mm)")
                 else:
                     self.set_status("重规划失败！目标不可达", "red")
                     self.navigator.state = old_state
