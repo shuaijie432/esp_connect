@@ -34,7 +34,7 @@ MQTT_USER = "esp_send"
 MQTT_PASS = "00000000"
 TOPIC_LIDAR = "esp/f79541/data"
 TOPIC_CONTROL = "device/f79541/data"
-TOPIC_OPENMV  = "openmv/nav"
+TOPIC_OPENMV  = "openmv111/nav"
 TOPIC_OPENMV_RECV = "openmv/data"      # 接收 OpenMV 发来的数据
 
 
@@ -268,7 +268,7 @@ class MainWindow(QMainWindow):
         self._last_nav_state = self.navigator.state
         self._nav_was_active = False
 
-        self._obstacle_fusion_interval = 0.5
+        self._obstacle_fusion_interval = 2.0  # 降低融合频率(原0.5s→2s)，减少重规划触发
         self._last_obstacle_fusion = 0.0
 
         self._hold_axes = {"vx": 0.0, "vy": 0.0, "vw": 0.0}
@@ -709,7 +709,7 @@ class MainWindow(QMainWindow):
         now = time.time()
         if not hasattr(self, '_last_path_blocked_check'):
             self._last_path_blocked_check = 0.0
-        if (now - self._last_path_blocked_check > 0.2
+        if (now - self._last_path_blocked_check > 2.0
                 and self.navigator.state == "FOLLOWING"
                 and not self._need_replan):
             self._last_path_blocked_check = now
@@ -719,8 +719,8 @@ class MainWindow(QMainWindow):
 
         if self._need_replan:
             self._need_replan = False
-            # 冷却时间：3 秒内不重复重规划，避免频繁解冻地图放大里程计漂移
-            if now - self._last_replan_time < 1.0:
+            # 冷却时间：5秒内不重复重规划，避免 A* 阻塞主线程导致 DWA 和雷达处理延迟
+            if now - self._last_replan_time < 5.0:
                 pass  # 跳过，等冷却
             elif self.navigator.waypoints:
                 target = self.navigator.waypoints[-1]
@@ -947,7 +947,7 @@ class MainWindow(QMainWindow):
         self._nav_was_active = False
 
         # 6. 重置障碍物融合状态
-        self._obstacle_fusion_interval = 0.5
+        self._obstacle_fusion_interval = 2.0
         self._last_obstacle_fusion = 0.0
         self._alignment_ack_done = False
         self._need_replan = False

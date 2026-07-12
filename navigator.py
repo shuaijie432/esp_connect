@@ -35,14 +35,14 @@ class Navigator:
         self.safety_margin_mm = 50.0           # DWA 额外安全余量
         self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 175mm
 
-        # A* 硬膨胀 = total_inflation / resolution = 175/10 ≈ 18 格
-        # 保证重规划路径离障碍物 ≥ 175mm（车身边缘外 50mm 安全间隙）
-        self.obstacle_margin = 12
+        # ★ A* 硬膨胀 = 16格 = 160mm（略小于 DWA 碰撞半宽 175mm，由代价梯度补足）
+        # DWA碰撞半宽 = robot_radius(125) + channel_margin(50) = 175mm
+        self.obstacle_margin = 16
 
-        # ★ 最小可通过通道参数（硬编码，独立于膨胀半径）
-        #   最小通道直径 = robot_width_mm + 2 * channel_margin_mm
+        # ★ DWA 碰撞框参数
+        # 碰撞半宽 = robot_radius(125) + channel_margin = 175mm，框宽350mm
         #   修改这个值影响 DWA 碰撞框 / 红色虚线圆 / 路径堵塞检测
-        self.channel_margin_mm = 80.0   # DWA碰撞框半宽=125+60=185mm，400mm走廊中可通行
+        self.channel_margin_mm = 50.0   # 碰撞半宽=125+50=175mm
         self.replan_threshold = 200.0
 
         self.replan_interval = 1.0
@@ -85,8 +85,11 @@ class Navigator:
         self._min_cluster_size = 1                               # 至少3个连成片的栅格才算障碍物（滤除噪点）
         self._permanent_after_sec = 1.5                          # 连续观测超过1.5秒 → 写入静态地图
         self._expire_after_sec = 10.0                            # 超过10秒未扫到 → 从静态地图删除
-        self._obstacle_cost_gain = 8.0                           # A*障碍物距离代价增益：越靠近障碍物代价越高
-        self._obstacle_cost_decay = 8.0                          # A*代价衰减距离（栅格数），超过后代价接近0
+        self._obstacle_cost_gain = 15.0                          # A*动态障碍物代价增益：近障碍物1步≈10步空地
+        self._obstacle_cost_decay = 8.0                          # A*代价衰减（栅格），越大惩罚扩散越远
+        self._static_cost_gain = 30.0                            # 静态墙壁额外代价：把路径推向走廊中心
+        self._static_cost_decay = 12.0                           # 静态墙壁代价衰减
+        self._static_cost_grid = None                            # 静态地图距离变换（独立于动态障碍物）
         self._obstacle_fusion_interval = 0.5
         self._stable_obstacles = {}
         self._obstacle_id_counter = 0
@@ -127,6 +130,14 @@ class Navigator:
         self._startup_align_stable = 0
         self._nav_count = 0  # 导航次数：首次=起点保护，后续=原地旋转对齐
         self.safety_boost = 0.0  # 安全余量加成(mm)，特定导航点可临时增大
+
+        # 检查 scipy 是否可用（binary_dilation 和 distance_transform_edt 依赖它）
+        try:
+            from scipy.ndimage import binary_dilation, distance_transform_edt
+            self._has_scipy = True
+        except ImportError:
+            self._has_scipy = False
+            print("[NAV] ⚠ scipy 未安装！膨胀和代价网格将使用慢速回退，A* 性能会下降")
 
         try:
             if self.mapper.static_map_mode:
@@ -219,11 +230,13 @@ class Navigator:
                 if 0 <= mx < grid.size and 0 <= my < grid.size:
                     combined_occ[my, mx] = True
 
-        # 4. 将机器人所在位置及其周围极小范围设为可通行。
-        # 注意：清空半径不能太大，否则会制造"人造空洞"，导致A*路径贴着墙壁走。
+        # 4. 膨胀前清空：将机器人周围障碍物从临时掩码中移除
+        # 清空半径 = obstacle_margin，覆盖 DWA 碰撞半宽内的全部障碍物
+        # 只影响本次 A* 的临时膨胀，不修改静态地图
         rx, ry = grid.world_to_map(robot_x, robot_y)
-        for dx in range(-2, 3):
-            for dy in range(-2, 3):
+        pre_clear = self.obstacle_margin  # 16格=160mm
+        for dx in range(-pre_clear, pre_clear + 1):
+            for dy in range(-pre_clear, pre_clear + 1):
                 nx, ny = rx + dx, ry + dy
                 if 0 <= nx < grid.size and 0 <= ny < grid.size:
                     combined_occ[ny, nx] = False
@@ -244,9 +257,10 @@ class Navigator:
                     padded[1:-1, 2:]
                 )
 
-        # 膨胀后只确保机器人中心栅格可通行（不要挖大洞）
-        for dx in range(-1, 2):
-            for dy in range(-1, 2):
+        # 膨胀后清空：确保 A* 起点周围有足够空间扩散
+        post_clear = max(self.obstacle_margin // 3, 4)  # 16/3≈5格=50mm → 11x11自由区
+        for dx in range(-post_clear, post_clear + 1):
+            for dy in range(-post_clear, post_clear + 1):
                 nx, ny = rx + dx, ry + dy
                 if 0 <= nx < grid.size and 0 <= ny < grid.size:
                     inflated[ny, nx] = False
@@ -255,11 +269,12 @@ class Navigator:
         #    用于 A* 代价函数，让路径自然远离障碍物，给 DWA 留出绕行空间
         try:
             from scipy.ndimage import distance_transform_edt
-            # distance_transform_edt: 输入 False=障碍物，返回每个点到最近 False 的距离
-            # 用 combined_occ（膨胀前的占用掩码）计算，避免膨胀本身产生的距离偏差
             self._cost_grid = distance_transform_edt(~combined_occ)
+            # 静态墙壁独立代价：指数衰减，把路径推向走廊中心
+            self._static_cost_grid = distance_transform_edt(~static_occ)
         except ImportError:
             self._cost_grid = None
+            self._static_cost_grid = None
 
         return inflated
 
@@ -785,10 +800,11 @@ class Navigator:
                         self.robot_width_mm / 2.0
                     )  # ≈ 230mm，即使静止也不能小于这个
                     speed_mag = math.hypot(cvx, cvy)
-                    # 方案B：始终使用完整碰撞尺寸，不随速度缩放
-                    # 窄道中保守优先，防止 shrunken 框误判可通过性
-                    dyn_half_len = half_len
-                    dyn_half_wid = half_wid
+                    # 速度缩放碰撞框：低速0.7倍(123mm>物理半径125mm?略小但可接受)
+                    # 高速1.0倍(175mm)，平滑过渡
+                    speed_ratio = 0.7 + 0.3 * min(speed_mag / max(self.MAX_VX, 1.0), 1.0)
+                    dyn_half_len = half_len * speed_ratio
+                    dyn_half_wid = half_wid * speed_ratio
 
                     # ---- 矩形碰撞检测 ----
                     min_side_clearance = float('inf')
@@ -890,6 +906,7 @@ class Navigator:
                         'clearance': min_clearance,
                         'side_clearance': min_side_clearance,
                         'side_collision': side_collision,
+                        'collision': collision,
                         'speed': speed,
                         'path_dev': path_dev,
                         'path_dir_score': path_dir_score,
@@ -926,50 +943,50 @@ class Navigator:
         nearest_obs = min([d for _, _, d in self._local_obstacles], default=1500)
         spacious = nearest_obs > 400
 
-        # 全向底盘：heading对齐(path_dir/turn_toward)权重大幅降低，
-        # 到达目标(heading)和路径贴近(path)是核心目标
+        # DWA权重哲学：A*规划全局安全路径，DWA在路径附近微调避障
+        # regression 权重极低：让 DWA 自由绕行，不被全局路径强力拉回
         if front_dist < 200:
-            base_weights = {'heading': 0.15, 'clearance': 0.35, 'velocity': 0.02,
+            base_weights = {'heading': 0.12, 'clearance': 0.38, 'velocity': 0.02,
                             'path': 0.20, 'path_dir': 0.02, 'vel_path': 0.05,
-                            'turn_toward': 0.03, 'regression': 0.10,
+                            'turn_toward': 0.03, 'regression': 0.04,
                             'smooth': 0.02, 'rotation': 0.01}
         elif emergency:
-            base_weights = {'heading': 0.06, 'clearance': 0.45, 'velocity': 0.03,
+            base_weights = {'heading': 0.05, 'clearance': 0.48, 'velocity': 0.03,
                             'path': 0.10, 'path_dir': 0.01, 'vel_path': 0.04,
-                            'turn_toward': 0.04, 'regression': 0.15,
+                            'turn_toward': 0.04, 'regression': 0.06,
                             'smooth': 0.03, 'rotation': 0.01}
         elif tight_space:
-            base_weights = {'heading': 0.10, 'clearance': 0.35, 'velocity': 0.04,
+            base_weights = {'heading': 0.08, 'clearance': 0.38, 'velocity': 0.04,
                             'path': 0.18, 'path_dir': 0.02, 'vel_path': 0.06,
-                            'turn_toward': 0.04, 'regression': 0.12,
+                            'turn_toward': 0.04, 'regression': 0.05,
                             'smooth': 0.02, 'rotation': 0.01}
         else:
-            # 宽敞环境：大幅提高 clearance 权重，确保远离障碍物
-            base_weights = {'heading': 0.10, 'clearance': 0.30, 'velocity': 0.05,
+            # 宽敞环境：避障为主，路径跟踪为辅
+            base_weights = {'heading': 0.08, 'clearance': 0.32, 'velocity': 0.05,
                             'path': 0.22, 'path_dir': 0.03, 'vel_path': 0.08,
-                            'turn_toward': 0.03, 'regression': 0.08,
+                            'turn_toward': 0.03, 'regression': 0.03,
                             'smooth': 0.03, 'rotation': 0.01}
 
-        # ---- 路径偏离越大，回归引力越强；但限制上限防止碾压避障 ----
+        # ---- 路径偏离时的回归因子：大幅降低，让 DWA 优先避障 ----
         if spacious:
             if dev < 80:
-                regression_boost = 0.3; path_boost = 0.6
+                regression_boost = 0.10; path_boost = 0.6
                 vel_path_boost = 0.6; turn_toward_boost = 0.5
             elif dev < 200:
-                regression_boost = 0.6; path_boost = 0.8
+                regression_boost = 0.25; path_boost = 0.8
                 vel_path_boost = 0.8; turn_toward_boost = 0.6
             else:
-                regression_boost = 1.0; path_boost = 1.0
+                regression_boost = 0.50; path_boost = 1.0
                 vel_path_boost = 1.0; turn_toward_boost = 0.7
         else:
             if dev < 80:
-                regression_boost = 0.4; path_boost = 0.8
+                regression_boost = 0.15; path_boost = 0.8
                 vel_path_boost = 0.6; turn_toward_boost = 0.5
             elif dev < 200:
-                regression_boost = 1.0; path_boost = 1.2
+                regression_boost = 0.40; path_boost = 1.2
                 vel_path_boost = 1.0; turn_toward_boost = 0.7
             else:
-                regression_boost = 1.5; path_boost = 1.5
+                regression_boost = 0.70; path_boost = 1.5
                 vel_path_boost = 1.2; turn_toward_boost = 0.8
 
         weights = dict(base_weights)
@@ -977,7 +994,7 @@ class Navigator:
         weights['path'] = base_weights['path'] * path_boost
         weights['vel_path'] = base_weights['vel_path'] * vel_path_boost
         weights['turn_toward'] = base_weights['turn_toward'] * turn_toward_boost
-        weights['clearance'] = base_weights['clearance'] * (1.2 if spacious else 2.5)
+        weights['clearance'] = base_weights['clearance'] * (1.5 if spacious else 2.5)
 
         # 归一化权重（确保总和为 1.0）
         total_w = sum(weights.values())
@@ -1045,7 +1062,6 @@ class Navigator:
         vx, vy, vw = best_vx, best_vy, best_vw
 
         # ---- 6. 后置路径修正混合：按偏离程度，将 DWA 输出向全局路径投影点拉回 ----
-        # 核心思想：DWA 可以自主绕行避障，但必须保持向全局路径回归的趋势。
         # 偏离越大，全局路径的"引力"越强。偏离 > 200mm 时拉回比例可达 70%。
         if current_path_dev > 30 and self.waypoints and self.current_wp < len(self.waypoints):
             # 用路径投影点作为引力目标
@@ -1067,13 +1083,12 @@ class Navigator:
                 # 回归 vw：朝向投影点方向（而不是路径切线方向），确保真正"拉回"路径
                 reg_vw = self.KP_W * math.atan2(reg_dy, reg_dx)
 
-                # ---- 路径回归混合比例 ----
-                # DWA 避障优先，路径回归只做轻量引导，不覆盖避障决策
+                # ---- 路径回归混合比例（极低，DWA 避障优先） ----
                 if emergency:
-                    blend = min(0.30, max(0.10, (current_path_dev - 50) / 300.0))
+                    blend = min(0.08, max(0.03, (current_path_dev - 80) / 500.0))
                 else:
-                    blend = min(0.25, max(0.05, (current_path_dev - 50) / 400.0))
-                vw_blend = blend * 0.3
+                    blend = min(0.06, max(0.02, (current_path_dev - 80) / 600.0))
+                vw_blend = blend * 0.15
 
                 vx = vx * (1.0 - blend) + reg_vx * blend
                 vy = vy * (1.0 - blend) + reg_vy * blend
@@ -1731,24 +1746,22 @@ class Navigator:
         vx = max(-max_vx, min(max_vx, vx_raw))  # 全向底盘允许后退
         vy = max(-max_vy, min(max_vy, vy_raw))
 
-        # 增强的路径回归约束（在狭窄通道中权重更高）
+        # 路径回归约束（极轻量，DWA 避障后有自然回归趋势即可）
         path_lateral_err, path_proj = self._calc_path_projection(x, y)
-        # 窄道中回归太激进会导致撞墙，降低增益；轻微蹭墙时进一步降低
-        regress_gain = 0.8 if channel_width < 900 else 1.2  # 降低回归增益，减少侧移
+        regress_gain = 0.3 if channel_width < 900 else 0.5  # 大幅降低回归增益
         if abs(path_lateral_err) > 10.0 and len(self.waypoints) > 2:
             reg_dx = path_proj[0] - x
             reg_dy = path_proj[1] - y
             reg_dist = math.hypot(reg_dx, reg_dy)
             if reg_dist > 5:
                 vy_correction = -path_lateral_err * regress_gain
-                # 窄道中限制侧向修正幅度，避免猛打方向
-                max_vy_correction = self.MAX_VY * 0.35 if channel_width < 1000 else self.MAX_VY * 0.5
+                max_vy_correction = self.MAX_VY * 0.15 if channel_width < 1000 else self.MAX_VY * 0.25
                 vy_correction = max(-max_vy_correction, min(max_vy_correction, vy_correction))
                 vy += vy_correction
 
                 reg_local_x = reg_dx * cos_t + reg_dy * sin_t
                 if reg_local_x > 0:
-                    vx += min(50.0, reg_local_x * 0.5)
+                    vx += min(20.0, reg_local_x * 0.2)
 
                 v_mag = math.hypot(vx, vy)
                 if v_mag > max_vx:
@@ -2155,7 +2168,14 @@ class Navigator:
                 else:
                     occ_penalty = 0.0
 
-                tentative = g_score[cy, cx] + cost + occ_penalty
+                # 静态墙壁额外代价：指数衰减，强力推开路径到走廊中心
+                if self._static_cost_grid is not None:
+                    static_dist = self._static_cost_grid[ny, nx]
+                    static_penalty = self._static_cost_gain * math.exp(-static_dist / self._static_cost_decay)
+                else:
+                    static_penalty = 0.0
+
+                tentative = g_score[cy, cx] + cost + occ_penalty + static_penalty
                 if tentative < g_score[ny, nx]:
                     came_from[(nx, ny)] = (cx, cy)
                     g_score[ny, nx] = tentative
