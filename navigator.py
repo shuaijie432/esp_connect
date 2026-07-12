@@ -947,8 +947,12 @@ class Navigator:
             if front_dist < 150.0:
                 print(f"[BRAKE] 前方障碍物 {front_dist:.0f}mm，速度缩放至 {speed_scale:.2f}")
 
-        # DWA 避障：安全过滤 + 路径跟踪选择（统一处理所有情况）
-        if self._dw_enabled:
+        # 终点精确到位：距离目标 < 200mm 时跳过 DWA，纯追踪直达
+        dist_to_goal = math.hypot(self.waypoints[-1][0] - x, self.waypoints[-1][1] - y) \
+                       if self.waypoints else float('inf')
+
+        # DWA 避障：安全过滤 + 路径跟踪选择
+        if self._dw_enabled and dist_to_goal >= 200.0:
             vx, vy, vw = self._dynamic_window_avoidance(
                 x, y, theta, base_vx, base_vy, base_vw)
             if obstacle_level == "EMERGENCY":
@@ -1396,7 +1400,7 @@ class Navigator:
         if is_final and dist < 400:
             kp_v = 0.25
 
-        # 狭窄通道检测：两侧都有障碍物时自动降速（阈值 500mm）
+        # 狭窄通道检测：两侧都有障碍物时自动降速（阈值 400mm）
         _, world_pts = self.mapper.get_latest_points()
         channel_width = float('inf')
         if world_pts:
@@ -1417,11 +1421,11 @@ class Navigator:
                     right_wall = min(right_wall, d)
             if left_wall < float('inf') and right_wall < float('inf'):
                 channel_width = left_wall + right_wall
-                if channel_width < 500:
-                    channel_scale = max(0.3, channel_width / 500.0)
+                if channel_width < 400:
+                    channel_scale = max(0.3, channel_width / 400.0)
                     max_vx *= channel_scale
                     max_vy *= channel_scale
-                    if channel_width < 400:
+                    if channel_width < 350:
                         print(f"[CHANNEL] 狭窄通道 {channel_width:.0f}mm，降速至 {channel_scale:.1f}")
 
         # 全向底盘：目标在后方时 local_x 为负，自然产生后退速度
