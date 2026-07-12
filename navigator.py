@@ -661,11 +661,10 @@ class Navigator:
     # 在速度空间 (vx, vy, vw) 中采样，推演轨迹，评估多目标代价后选择最优
     # ============================================================
     def _dynamic_window_avoidance(self, x, y, theta, base_vx, base_vy, base_vw, emergency=False) -> Tuple[float, float, float]:
-        """DWA: 安全过滤 + 路径跟踪选择（第一性原理重写）
+        """DWA: 两级碰撞检测 + 路径跟踪选择
 
-        1. 大碰撞边距(300mm半宽) → 不碰撞 = 自然远离障碍物
-        2. 碰撞的轨迹丢弃，安全的轨迹中选离 lookahead 最近的
-        3. 全部碰撞时选 clearance 最好的
+        硬边界 (125mm): 物理车身 → 碰撞 = 绝对禁止
+        舒适边界 (300mm): 车身+边距 → 碰撞 = 标记为"紧贴"，仅在没有舒适候选时允许
         """
         self._update_local_costmap(x, y, theta)
 
@@ -675,10 +674,16 @@ class Navigator:
                        y + ox * sin0 + oy * cos0)
                       for ox, oy, _ in self._local_obstacles]
 
-        # ---- 碰撞边距：300mm 半宽 = 机器人 125mm + 边距 175mm ----
-        MARGIN = 175.0
-        half_len = self.robot_length_mm / 2.0 + MARGIN
-        half_wid = self.robot_width_mm / 2.0 + MARGIN
+        # ---- 两级碰撞半宽 ----
+        # 硬边界：物理车身，不可逾越
+        PHYS_MARGIN = 0.0
+        phys_hl = self.robot_length_mm / 2.0 + PHYS_MARGIN   # 125mm
+        phys_hw = self.robot_width_mm / 2.0 + PHYS_MARGIN    # 125mm
+
+        # 舒适边界：期望保持的距离
+        COMFORT_MARGIN = 175.0
+        comfort_hl = phys_hl + COMFORT_MARGIN                 # 300mm
+        comfort_hw = phys_hw + COMFORT_MARGIN                 # 300mm
 
         # ---- 速度窗口 ----
         dt = 0.3
@@ -689,11 +694,8 @@ class Navigator:
         vw_min = max(-self.MAX_VW, base_vw - 2.0 * dt)
         vw_max = min(self.MAX_VW, base_vw + 2.0 * dt)
 
-        vx_samples = np.linspace(vx_min, vx_max, 7)
-        vy_samples = np.linspace(vy_min, vy_max, 5)
-        vw_samples = np.linspace(vw_min, vw_max, 5)
-        predict_time = 0.5
-        time_step = 0.1
+        predict_time = 1.5    # 预测 1.5 秒，覆盖 225mm（150mm/s），确保前方障碍物可见
+        time_step = 0.15      # 10 步推演
 
         # ---- Lookahead 目标点 ----
         if self.waypoints and self.current_wp < len(self.waypoints):
@@ -703,15 +705,52 @@ class Navigator:
         else:
             target = None
 
+        # ---- 路径导向采样：密集采样在 A* 方向附近，稀疏覆盖绕行方向 ----
+        if target:
+            # 目标在机器人坐标系中的方向
+            dx_w = target[0] - x
+            dy_w = target[1] - y
+            dx_local = dx_w * cos0 + dy_w * sin0
+            dy_local = -dx_w * sin0 + dy_w * cos0
+
+            # 理想速度：朝向目标点
+            ideal_vx = np.clip(self.KP_V * dx_local, vx_min, vx_max)
+            ideal_vy = np.clip(self.KP_V * dy_local * 0.7, vy_min, vy_max)
+            target_angle = math.atan2(dy_local, max(dx_local, 1.0))
+            ideal_vw = np.clip(self.KP_W * target_angle, vw_min, vw_max)
+
+            # 在理想速度附近密集采样（5个点），边缘稀疏覆盖（各1个点）
+            # vx: [vx_min] [3点近ideal] [vx_max]
+            near_vx = np.linspace(
+                max(vx_min, ideal_vx - (ideal_vx - vx_min) * 0.4),
+                min(vx_max, ideal_vx + (vx_max - ideal_vx) * 0.4), 5)
+            vx_samples = np.unique(np.concatenate([[vx_min], near_vx, [vx_max]]))
+
+            near_vy = np.linspace(
+                max(vy_min, ideal_vy - (ideal_vy - vy_min) * 0.4),
+                min(vy_max, ideal_vy + (vy_max - ideal_vy) * 0.4), 3)
+            vy_samples = np.unique(np.concatenate([[vy_min], near_vy, [vy_max]]))
+
+            near_vw = np.linspace(
+                max(vw_min, ideal_vw - 0.15),
+                min(vw_max, ideal_vw + 0.15), 4)
+            vw_samples = np.unique(np.concatenate([[vw_min], near_vw, [vw_max]]))
+        else:
+            vx_samples = np.linspace(vx_min, vx_max, 7)
+            vy_samples = np.linspace(vy_min, vy_max, 5)
+            vw_samples = np.linspace(vw_min, vw_max, 5)
+
         # ---- 评估所有候选轨迹 ----
-        safe = []
+        comfort_safe = []   # 舒适边界内无障碍
+        tight_ok = []       # 硬边界 OK 但舒适边界有侵入
         all_cands = []
 
         for cvx in vx_samples:
             for cvy in vy_samples:
                 for cvw in vw_samples:
                     px, py, ptheta = x, y, theta
-                    collision = False
+                    hard_collision = False
+                    comfort_collision = False
                     min_cl = float('inf')
                     steps = int(predict_time / time_step)
 
@@ -724,34 +763,64 @@ class Navigator:
                         for ob_wx, ob_wy in obs_world:
                             dx_l = (ob_wx - px) * ct + (ob_wy - py) * st
                             dy_l = -(ob_wx - px) * st + (ob_wy - py) * ct
-                            d = max(abs(dx_l) - half_len, abs(dy_l) - half_wid)
-                            min_cl = min(min_cl, d)
-                            if abs(dx_l) < half_len and abs(dy_l) < half_wid:
-                                collision = True
+
+                            # 舒适边界距离（用于评分）
+                            d_comfort = max(abs(dx_l) - comfort_hl, abs(dy_l) - comfort_hw)
+                            min_cl = min(min_cl, d_comfort)
+
+                            # 硬碰撞检测：物理车身
+                            if abs(dx_l) < phys_hl and abs(dy_l) < phys_hw:
+                                hard_collision = True
                                 break
-                        if collision:
+                            # 舒适碰撞检测：舒适边界
+                            if abs(dx_l) < comfort_hl and abs(dy_l) < comfort_hw:
+                                comfort_collision = True
+                        if hard_collision:
                             break
 
                     path_dist = math.hypot(target[0] - px, target[1] - py) if target else 0.0
 
                     cand = {'vx': cvx, 'vy': cvy, 'vw': cvw,
-                            'collision': collision, 'clearance': min_cl,
-                            'path_dist': path_dist}
+                            'hard_collision': hard_collision,
+                            'comfort_collision': comfort_collision,
+                            'clearance': min_cl, 'path_dist': path_dist}
                     all_cands.append(cand)
-                    if not collision:
-                        safe.append(cand)
+
+                    if not hard_collision:
+                        tight_ok.append(cand)
+                        if not comfort_collision:
+                            comfort_safe.append(cand)
 
         # ---- 选择最优轨迹 ----
-        if safe:
-            # 安全优先：在安全候选里选离目标最近的
-            best = min(safe, key=lambda c: c['path_dist'])
+        if comfort_safe:
+            # 舒适安全 → 选离目标最近的（紧跟 A* 路径）
+            best = min(comfort_safe, key=lambda c: c['path_dist'])
+        elif tight_ok:
+            # 紧贴模式 → 综合评分：clearance(60%) + path_dist(40%)
+            # 纯两段筛选会让 path_dist 压制 clearance → 不绕行
+            cl_vals = [c['clearance'] for c in tight_ok]
+            pd_vals = [c['path_dist'] for c in tight_ok]
+            cl_min, cl_max = min(cl_vals), max(cl_vals)
+            pd_min, pd_max = min(pd_vals), max(pd_vals)
+            cl_r = cl_max - cl_min + 1e-6
+            pd_r = pd_max - pd_min + 1e-6
+            for c in tight_ok:
+                c['score'] = (c['clearance'] - cl_min) / cl_r * 0.6 \
+                           + (1.0 - (c['path_dist'] - pd_min) / pd_r) * 0.4
+            best = max(tight_ok, key=lambda c: c['score'])
         elif all_cands:
-            # 全部碰撞：选 clearance 最好的（最不危险）
+            # 全部碰撞 → 选 clearance 最好的
             best = max(all_cands, key=lambda c: c['clearance'])
         else:
             return base_vx, base_vy, base_vw
 
         vx, vy, vw = best['vx'], best['vy'], best['vw']
+
+        # ---- 紧贴模式自动降速 ----
+        if best.get('comfort_collision', False):
+            speed_scale = 0.5
+            vx *= speed_scale
+            vy *= speed_scale
 
         # ---- 限幅 ----
         vx = max(-self.MAX_VX, min(self.MAX_VX, vx))
@@ -1327,7 +1396,7 @@ class Navigator:
         if is_final and dist < 400:
             kp_v = 0.25
 
-        # 狭窄通道检测：两侧都有障碍物时自动降速
+        # 狭窄通道检测：两侧都有障碍物时自动降速（阈值 500mm）
         _, world_pts = self.mapper.get_latest_points()
         channel_width = float('inf')
         if world_pts:
@@ -1348,11 +1417,11 @@ class Navigator:
                     right_wall = min(right_wall, d)
             if left_wall < float('inf') and right_wall < float('inf'):
                 channel_width = left_wall + right_wall
-                if channel_width < 1200:
-                    channel_scale = max(0.3, channel_width / 1200.0)
+                if channel_width < 500:
+                    channel_scale = max(0.3, channel_width / 500.0)
                     max_vx *= channel_scale
                     max_vy *= channel_scale
-                    if channel_width < 800:
+                    if channel_width < 400:
                         print(f"[CHANNEL] 狭窄通道 {channel_width:.0f}mm，降速至 {channel_scale:.1f}")
 
         # 全向底盘：目标在后方时 local_x 为负，自然产生后退速度
@@ -1371,14 +1440,14 @@ class Navigator:
 
         # 路径回归约束（极轻量，DWA 避障后有自然回归趋势即可）
         path_lateral_err, path_proj = self._calc_path_projection(x, y)
-        regress_gain = 0.3 if channel_width < 900 else 0.5  # 大幅降低回归增益
+        regress_gain = 0.3 if channel_width < 450 else 0.5
         if abs(path_lateral_err) > 10.0 and len(self.waypoints) > 2:
             reg_dx = path_proj[0] - x
             reg_dy = path_proj[1] - y
             reg_dist = math.hypot(reg_dx, reg_dy)
             if reg_dist > 5:
                 vy_correction = -path_lateral_err * regress_gain
-                max_vy_correction = self.MAX_VY * 0.15 if channel_width < 1000 else self.MAX_VY * 0.25
+                max_vy_correction = self.MAX_VY * 0.15 if channel_width < 450 else self.MAX_VY * 0.25
                 vy_correction = max(-max_vy_correction, min(max_vy_correction, vy_correction))
                 vy += vy_correction
 
