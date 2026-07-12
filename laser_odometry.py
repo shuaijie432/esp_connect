@@ -281,8 +281,14 @@ class LaserOdometry:
                         score += self.miss_penalty
                     # 未知区域不加分不扣分
 
-            # 权重 = exp(score * scale)，scale 越大好坏粒子区分越明显
-            p.weight = math.exp(score * 0.8)  # 提高区分度（0.5→0.8），增强定位校正力
+            # 权重 = exp(avg_score × scale)，按点数归一化防止溢出
+            # avg_score ∈ [-1.0, 4.0]，scale=2.0 使 best:median ≈ 400:1
+            n = len(local_points)
+            if n > 0:
+                avg_score = score / n
+                p.weight = math.exp(avg_score * 2.0)
+            else:
+                p.weight = 1.0
 
     def _normalize_weights(self):
         """归一化粒子权重"""
