@@ -284,6 +284,7 @@ class MainWindow(QMainWindow):
         self._auto_nav_triggered = False
         self._is_java_nav = False      # MQTT "2" 触发的导航，对齐完成后不发 OpenMV
         self._is_openmv_nav = False   # OpenMV 0xA2 触发的导航，完成后发 "1" 给 OpenMV
+        self._openmv_a2_count = 0     # 0xA2 接收计数：第1次→(1170,-1520)，第2次→(25,30)
 
         # ---- 点位文件顺序导航 ----
         self._waypoint_list = []       # 从JSON加载的点位列表
@@ -303,6 +304,8 @@ class MainWindow(QMainWindow):
         self._is_java_nav = True
         self.navigator.final_approach_dist = 500.0
         self.navigator.safety_boost = 60.0  # 碰撞框额外扩大60mm
+        if self.ws_server:
+            self.ws_server.send_text("2")
         self.start_navigation()
 
     def _on_nav_zero_trigger(self):
@@ -314,6 +317,8 @@ class MainWindow(QMainWindow):
         self._is_java_nav = True
         self.navigator.final_approach_dist = 500.0
         self.navigator.safety_boost = 60.0  # 碰撞框额外扩大60mm
+        if self.ws_server:
+            self.ws_server.send_text("1")
         self.start_navigation()
 
     def _on_ws_cmd_5(self):
@@ -343,17 +348,25 @@ class MainWindow(QMainWindow):
         if data_len == 1:
             cmd = data[0]
             if cmd == 0xA2:
-                self.openmv_label.setText(f"OpenMV: 收到 0xA2 → 导航至 (1170, -1520)")
-                self.openmv_label.setStyleSheet(
-                    "font-size: 12px; line-height: 1.4; color: #66ff66;"
-                )
-                print("[OPENMV] → 收到 0xA2，触发导航 → (1170, -1520) @ -180°")
-                # 自动触发导航
-                self.target_x.setText("1170")
-                self.target_y.setText("-1520")
-                self.target_theta_deg.setText("-180")
-                self._is_openmv_nav = True  # 标记：完成后发 "1" 给 OpenMV
-                self.start_navigation()
+                self._openmv_a2_count += 1
+                if self._openmv_a2_count == 1:
+                    print(f"[OPENMV] 第1次收到 0xA2 → 跳过，不导航")
+                    self.openmv_label.setText(f"OpenMV: 0xA2 (#1) → 跳过")
+                    self.openmv_label.setStyleSheet(
+                        "font-size: 12px; line-height: 1.4; color: #ffcc00;"
+                    )
+                else:
+                    tx, ty, tdeg = "25", "30", "0"
+                    print(f"[OPENMV] 第{self._openmv_a2_count}次收到 0xA2 → 导航至 ({tx}, {ty}) @ {tdeg}°")
+                    self.openmv_label.setText(f"OpenMV: 0xA2 (#{self._openmv_a2_count}) → ({tx}, {ty})")
+                    self.openmv_label.setStyleSheet(
+                        "font-size: 12px; line-height: 1.4; color: #66ff66;"
+                    )
+                    self.target_x.setText(tx)
+                    self.target_y.setText(ty)
+                    self.target_theta_deg.setText(tdeg)
+                    self._is_openmv_nav = True
+                    self.start_navigation()
             elif cmd == 0x02:
                 self.openmv_label.setText(f"OpenMV: 收到指令 0x02")
                 self.openmv_label.setStyleSheet(
@@ -694,9 +707,10 @@ class MainWindow(QMainWindow):
                     self.send_last_waypoint_frame()
                     self._is_java_nav = False
 
-                # ---- OpenMV 0xA2 导航完成 → 发送 "1" 给 OpenMV ----
+                # ---- OpenMV 0xA2 导航完成 → 发 "0" 给 WebSocket ----
                 elif self.navigator.state == "DONE" and self._is_openmv_nav:
-                    self._send_openmv_signal()
+                    if self.ws_server:
+                        self.ws_server.send_text("0")
                     self._is_openmv_nav = False
             return
 

@@ -92,6 +92,14 @@ class WebSocketServer:
         """绑定 MapWidget，用于前端点击时转换坐标"""
         self._map_view = widget
 
+    def send_text(self, text: str):
+        """向所有 WebSocket 客户端发送纯文本"""
+        if not self._clients:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._broadcast_text(json.dumps({"action": "text", "data": text})), self._loop
+        )
+
     # ==================== 广播方法（从 PyQt5 主线程调用） ====================
 
     def broadcast_full_state(self):

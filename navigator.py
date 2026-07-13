@@ -816,9 +816,12 @@ class Navigator:
 
         vx, vy, vw = best['vx'], best['vy'], best['vw']
 
-        # ---- 紧贴模式自动降速 ----
+        # ---- 紧贴模式降速：按 clearance 比例，越靠近硬边界越慢 ----
         if best.get('comfort_collision', False):
-            speed_scale = 0.5
+            # clearance ∈ [-175, 0] (舒适边界→硬边界)
+            # 映射到 speed ∈ [0.3, 0.8]，窄道居中时可到 0.5-0.7
+            cl = max(-COMFORT_MARGIN, min(0.0, best['clearance']))
+            speed_scale = 0.3 + 0.5 * (cl + COMFORT_MARGIN) / COMFORT_MARGIN
             vx *= speed_scale
             vy *= speed_scale
 
