@@ -285,6 +285,8 @@ class MainWindow(QMainWindow):
         self._is_java_nav = False      # MQTT "2" 触发的导航，对齐完成后不发 OpenMV
         self._is_openmv_nav = False   # OpenMV 0xA2 触发的导航，完成后发 "1" 给 OpenMV
         self._openmv_a2_count = 0     # 0xA2 接收计数：第1次→(1170,-1520)，第2次→(25,30)
+        self._suppress_lidar = False  # WS_CMD_5 导航完成后→_on_nav_zero_trigger 之前，抑制雷达点云
+        self._ws_cmd_5_active = False # 标记 WS_CMD_5 导航正在进行中
 
         # ---- 点位文件顺序导航 ----
         self._waypoint_list = []       # 从JSON加载的点位列表
@@ -310,11 +312,12 @@ class MainWindow(QMainWindow):
 
     def _on_nav_zero_trigger(self):
         """MQTT "0" 触发导航 → (350, -1450) @ -90°"""
-        print("[NAV_ZERO] 触发导航 -> (310, -1395) @ -90°")
-        self.target_x.setText("310")
+        print("[NAV_ZERO] 触发导航 -> (320, -1395) @ -90°")
+        self.target_x.setText("320")
         self.target_y.setText("-1395")
         self.target_theta_deg.setText("-90")
         self._is_java_nav = True
+        self._suppress_lidar = False  # 恢复雷达点云接收与绘制
         self.navigator.final_approach_dist = 300.0
         self.navigator.safety_boost = 3.0  # 碰撞框额外扩大60mm
         if self.ws_server:
@@ -328,6 +331,7 @@ class MainWindow(QMainWindow):
         self.target_y.setText("-90")
         self.target_theta_deg.setText("-10")
         self.navigator._nav_count = 0  # 确保作为首次导航，走起点保护流程
+        self._ws_cmd_5_active = True
         self.start_navigation()
 
     def _on_ws_cmd_6(self):
@@ -682,6 +686,15 @@ class MainWindow(QMainWindow):
             if self._nav_was_active:
                 self.send_velocity_command(0.0, 0.0, 0.0)
                 self._nav_was_active = False
+
+                # ---- WS_CMD_5 导航完成 → 开始抑制雷达点云（直到 _on_nav_zero_trigger） ----
+                if self._ws_cmd_5_active and self.navigator.state == "DONE":
+                    self._suppress_lidar = True
+                    self._ws_cmd_5_active = False
+                    with self.mapper.lock:
+                        self.mapper.latest_points_local = []
+                        self.mapper.latest_points_world = []
+                    print("[LIDAR] WS_CMD_5 导航完成，开始抑制雷达点云接收与绘制")
 
                 # ---- 点位顺序导航：当前点完成 → 自动启动下一点 ----
                 if (self.navigator.state == "DONE"
@@ -1104,7 +1117,7 @@ def processing_thread(frame_queue: Queue, mapper: LidarMapper, comm: Communicate
                 print(f"[DIAG] 本帧: 雷达点={len(points)} payload={len(payload)}B")
 
             laser_success = False
-            if len(points) >= 10:
+            if not window._suppress_lidar and len(points) >= 10:
                 local_pts = []
                 for pt in points:
                     rad = math.radians(pt.angle)
@@ -1172,7 +1185,7 @@ def processing_thread(frame_queue: Queue, mapper: LidarMapper, comm: Communicate
                 last_pose = (odom.x, odom.y, odom.theta)
                 comm.new_odom.emit()
 
-            if len(points) >= 3:
+            if not window._suppress_lidar and len(points) >= 3:
                 with mapper.lock:
                     mapper.frame_count += 1
                     mapper.total_points += len(points)
