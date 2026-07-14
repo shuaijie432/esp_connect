@@ -297,8 +297,8 @@ class MainWindow(QMainWindow):
 
     def _on_java_nav_trigger(self):
         """Java MQTT触发导航 → (1300, -175) @ 90°"""
-        print("[JAVA_NAV] 触发导航 -> (1250, -50) @ 90°")
-        self.target_x.setText("1290")
+        print("[JAVA_NAV] 触发导航 -> (1270, -50) @ 90°")
+        self.target_x.setText("1280")
         self.target_y.setText("-250")
         self.target_theta_deg.setText("90")
         self._is_java_nav = True
@@ -310,10 +310,10 @@ class MainWindow(QMainWindow):
 
     def _on_nav_zero_trigger(self):
         """MQTT "0" 触发导航 → (350, -1450) @ -90°"""
-        print("[NAV_ZERO] 触发导航 -> (310, -1395) @ -90°")
-        self.target_x.setText("310")
+        print("[NAV_ZERO] 触发导航 -> (330, -1395) @ -90°")
+        self.target_x.setText("330")
         self.target_y.setText("-1395")
-        self.target_theta_deg.setText("-90")
+        self.target_theta_deg.setText("-85")
         self._is_java_nav = True
         self.navigator.final_approach_dist = 300.0
         self.navigator.safety_boost = 3.0  # 碰撞框额外扩大60mm

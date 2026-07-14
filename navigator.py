@@ -257,8 +257,8 @@ class Navigator:
                     padded[1:-1, 2:]
                 )
 
-        # 膨胀后清空：确保 A* 起点周围有足够空间扩散
-        post_clear = max(self.obstacle_margin // 3, 4)  # 16/3≈5格=50mm → 11x11自由区
+        # 膨胀后清空：确保 A* 有足够空间从起点扩展（太小会导致无路径）
+        post_clear = max(self.obstacle_margin // 2, 10)  # 10格=100mm，A* 起步空间充足
         for dx in range(-post_clear, post_clear + 1):
             for dy in range(-post_clear, post_clear + 1):
                 nx, ny = rx + dx, ry + dy
@@ -630,7 +630,36 @@ class Navigator:
             tracked_added.add(key)
             self._local_obstacles.append((local_x, local_y, dist))
 
-        self._inflate_local_costmap()
+        # ---- 注入静态地图墙壁：雷达漏掉的墙壁由地图兜底 ----
+        static_grid = self.mapper.map
+        if static_grid is not None:
+            rx_m, ry_m = static_grid.world_to_map(robot_x, robot_y)
+            sample_radius_cells = 100    # 100 格 = 1000mm
+            stride = 3                    # 每 3 格 (30mm) 采样一次
+            occ_thresh = static_grid.occ_thresh
+            static_added = 0
+            for dy_c in range(-sample_radius_cells, sample_radius_cells + 1, stride):
+                for dx_c in range(-sample_radius_cells, sample_radius_cells + 1, stride):
+                    mx = rx_m + dx_c
+                    my = ry_m + dy_c
+                    if 0 <= mx < static_grid.size and 0 <= my < static_grid.size:
+                        if static_grid.log_odds[my, mx] > occ_thresh:
+                            wx, wy = static_grid.map_to_world(mx, my)
+                            # 去重：如果 50mm 内已有雷达点，跳过
+                            key = (round(wx / 50.0), round(wy / 50.0))
+                            if key in current_keys:
+                                continue
+                            dx_w = wx - robot_x
+                            dy_w = wy - robot_y
+                            dist_w = math.hypot(dx_w, dy_w)
+                            if dist_w < 30 or dist_w > 1100:
+                                continue
+                            local_x = dx_w * math.cos(robot_theta) + dy_w * math.sin(robot_theta)
+                            local_y = -dx_w * math.sin(robot_theta) + dy_w * math.cos(robot_theta)
+                            self._local_obstacles.append((local_x, local_y, dist_w))
+                            static_added += 1
+            if static_added > 50:
+                print(f"[DWA] 静态地图注入 {static_added} 个墙壁点（雷达盲区兜底）")
         self._local_costmap_center = (robot_x, robot_y)
         self._local_costmap_valid = True
 
@@ -940,7 +969,8 @@ class Navigator:
                             self._total_replan_count += 1
                             return 0.0, 0.0, 0.0
                         else:
-                            self.state = "FAILED"
+                            # 重规划失败不终止导航，退化为紧急避障续命
+                            print("[NAV] 卡住重规划失败，改用紧急避障")
                             return 0.0, 0.0, 0.0
                 while self._stuck_pos_history and now - self._stuck_pos_history[0][2] > self._stuck_check_duration:
                     self._stuck_pos_history.popleft()
@@ -1090,12 +1120,19 @@ class Navigator:
         start = (self.mapper.pose.x, self.mapper.pose.y)
         goal = (x, y)
 
+        was_frozen = self._plan_frozen  # 记录之前的冻结状态
         self._freeze_planning_map()
 
         raw_path = self._astar(start, goal)
         if not raw_path:
-            self.state = "FAILED"
-            self._unfreeze_planning_map()
+            if not was_frozen:
+                # 首次规划失败 → 真正的不可达
+                self.state = "FAILED"
+                self._unfreeze_planning_map()
+                print(f"[NAV] A* 首次规划失败，目标不可达")
+            else:
+                # 重规划失败 → 保留旧路径继续走
+                print(f"[NAV] A* 重规划失败，保留旧路径继续")
             return False
 
         self.path = raw_path
@@ -1521,14 +1558,20 @@ class Navigator:
             path_angle = target_angle
 
         path_angle_diff = self._normalize_angle(path_angle - theta)
-        vw_err = angle_diff * 0.9 + path_angle_diff * 0.1  # 更积极地转向目标，给绕行更多自由度
+        vw_err = angle_diff * 0.9 + path_angle_diff * 0.1
         vw = max(-max_vw, min(max_vw, self.KP_W * vw_err))
 
-        # 全向底盘：大角度差不需要大幅减速，可以后退或侧移
-        if abs_angle > math.radians(60):
-            vx *= 0.6
-            if abs_angle > math.radians(90):
-                print(f"[TURN] 角度差 {math.degrees(abs_angle):.1f}°，目标在后方，减速")
+        # 大角度差：先原地转向对准，再前进（避免边转边前进的螺旋轨迹）
+        if abs_angle > math.radians(90):
+            vx, vy = 0.0, 0.0       # 原地转向，不平移
+            vw = max(-0.5, min(0.5, self.KP_W * vw_err * 0.5))
+            print(f"[TURN] 角度差 {math.degrees(abs_angle):.1f}°，原地转向对准目标")
+        elif abs_angle > math.radians(45):
+            vx *= 0.2                # 微进 + 主转向
+            vy *= 0.2
+            vw *= 0.6
+        elif abs_angle > math.radians(20):
+            vw *= 0.8                # 轻微调整，不减速
 
         return vx, vy, vw
 
@@ -1607,22 +1650,12 @@ class Navigator:
             elif -110 < angle_deg <= -60:
                 right_min = min(right_min, dist)
 
-        # 如果前方还有足够空间（350mm+），检查侧面是否需要避让
-        if front_min > 350 and fleft_min > 300 and fright_min > 300:
-            # 侧面有近距离障碍物：向远离障碍物方向侧移
-            if left_min < 200:
-                # 左侧有障碍物，向右前方移动
-                side_speed = min(80.0, max(30.0, (200.0 - left_min) * 0.5))
-                print(f"[EVADE] 左侧障碍物 {left_min:.0f}mm，向右避让 vy={side_speed:.0f}")
-                return 60.0, -side_speed, 0.0
-            if right_min < 200:
-                # 右侧有障碍物，向左前方移动
-                side_speed = min(80.0, max(30.0, (200.0 - right_min) * 0.5))
-                print(f"[EVADE] 右侧障碍物 {right_min:.0f}mm，向左避让 vy={side_speed:.0f}")
-                return 60.0, side_speed, 0.0
-            # 前方和侧面都宽敞，回到路径跟踪
+        # 前方安全（>300mm）：退出避障，交给 DWA/pure pursuit 正常导航
+        # 侧面有障碍物是正常的（刚绕过还在旁边），不应继续横移
+        if front_min > 300:
+            print(f"[EVADE] 前方已安全({front_min:.0f}mm)，退出避障→正常导航")
             base_vx, base_vy, base_vw = self._pure_pursuit_step(x, y, theta)
-            return base_vx * 0.3, base_vy * 0.3, base_vw * 0.3
+            return base_vx * 0.5, base_vy * 0.5, base_vw * 0.5
 
 
         # 基于路径方向搜索最优安全方向
