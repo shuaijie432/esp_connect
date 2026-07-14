@@ -34,7 +34,7 @@ MQTT_USER = "esp_send"
 MQTT_PASS = "00000000"
 TOPIC_LIDAR = "esp/f79541/data"
 TOPIC_CONTROL = "device/f79541/data"
-TOPIC_OPENMV  = "openmv111/nav"
+TOPIC_OPENMV  = "openmv/nav"
 TOPIC_OPENMV_RECV = "openmv/data"      # 接收 OpenMV 发来的数据
 
 
@@ -297,26 +297,26 @@ class MainWindow(QMainWindow):
 
     def _on_java_nav_trigger(self):
         """Java MQTT触发导航 → (1300, -175) @ 90°"""
-        print("[JAVA_NAV] 触发导航 -> (1230, -130) @ 90°")
+        print("[JAVA_NAV] 触发导航 -> (1250, -50) @ 90°")
         self.target_x.setText("1290")
-        self.target_y.setText("-130")
+        self.target_y.setText("-250")
         self.target_theta_deg.setText("90")
         self._is_java_nav = True
-        self.navigator.final_approach_dist = 500.0
-        self.navigator.safety_boost = 60.0  # 碰撞框额外扩大60mm
+        self.navigator.final_approach_dist = 300.0
+        self.navigator.safety_boost = 10.0  # 碰撞框额外扩大60mm
         if self.ws_server:
             self.ws_server.send_text("2")
         self.start_navigation()
 
     def _on_nav_zero_trigger(self):
         """MQTT "0" 触发导航 → (350, -1450) @ -90°"""
-        print("[NAV_ZERO] 触发导航 -> (350, -1450) @ -90°")
-        self.target_x.setText("350")
-        self.target_y.setText("-1500")
+        print("[NAV_ZERO] 触发导航 -> (310, -1395) @ -90°")
+        self.target_x.setText("310")
+        self.target_y.setText("-1395")
         self.target_theta_deg.setText("-90")
         self._is_java_nav = True
-        self.navigator.final_approach_dist = 500.0
-        self.navigator.safety_boost = 60.0  # 碰撞框额外扩大60mm
+        self.navigator.final_approach_dist = 300.0
+        self.navigator.safety_boost = 3.0  # 碰撞框额外扩大60mm
         if self.ws_server:
             self.ws_server.send_text("1")
         self.start_navigation()
@@ -324,9 +324,9 @@ class MainWindow(QMainWindow):
     def _on_ws_cmd_5(self):
         """前端 WebSocket 发送 "5" → 触发导航（帧数>30后由前端确认启动）"""
         print("[WS_CMD_5] 前端触发 → 导航至 (400, -90) @ 0°")
-        self.target_x.setText("400")
+        self.target_x.setText("380")
         self.target_y.setText("-90")
-        self.target_theta_deg.setText("0")
+        self.target_theta_deg.setText("-10")
         self.navigator._nav_count = 0  # 确保作为首次导航，走起点保护流程
         self.start_navigation()
 
@@ -604,8 +604,8 @@ class MainWindow(QMainWindow):
             return
 
         frame = bytearray()
-        frame.append(0xAA)
-        frame.append(0x55)
+        frame.append(0xCC)
+        frame.append(0x66)
         frame.append(0x01)
         frame.append(0xA2)
         checksum = sum(frame[2:]) & 0xFF

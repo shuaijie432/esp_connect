@@ -580,7 +580,7 @@ class Navigator:
             dx = wx - robot_x
             dy = wy - robot_y
             dist = math.hypot(dx, dy)
-            if dist > 1500 or dist < 80:
+            if dist > 1500 or dist < 20:  # 只过滤 20mm 内的自身反射，保留近距离障碍物
                 continue
             key = (round(wx / 50.0), round(wy / 50.0))
             current_keys.add(key)
@@ -754,6 +754,25 @@ class Navigator:
                     min_cl = float('inf')
                     steps = int(predict_time / time_step)
 
+                    # ---- t=0 碰撞检测：检查当前位置是否已在障碍物内 ----
+                    ct0, st0 = cos0, sin0
+                    for ob_wx, ob_wy in obs_world:
+                        dx_l0 = (ob_wx - x) * ct0 + (ob_wy - y) * st0
+                        dy_l0 = -(ob_wx - x) * st0 + (ob_wy - y) * ct0
+                        d0 = max(abs(dx_l0) - comfort_hl, abs(dy_l0) - comfort_hw)
+                        min_cl = min(min_cl, d0)
+                        if abs(dx_l0) < phys_hl and abs(dy_l0) < phys_hw:
+                            hard_collision = True
+                            break
+                        if abs(dx_l0) < comfort_hl and abs(dy_l0) < comfort_hw:
+                            comfort_collision = True
+                    if hard_collision:
+                        cand = {'vx': cvx, 'vy': cvy, 'vw': cvw,
+                                'hard_collision': True, 'comfort_collision': True,
+                                'clearance': min_cl, 'path_dist': 99999.0}
+                        all_cands.append(cand)
+                        continue
+
                     for _ in range(steps):
                         ptheta += cvw * time_step
                         px += cvx * math.cos(ptheta) * time_step - cvy * math.sin(ptheta) * time_step
@@ -793,8 +812,19 @@ class Navigator:
 
         # ---- 选择最优轨迹 ----
         if comfort_safe:
-            # 舒适安全 → 选离目标最近的（紧跟 A* 路径）
-            best = min(comfort_safe, key=lambda c: c['path_dist'])
+            # 开阔空间：综合评分 = 路径距离(60%) + 远离障碍物(40%)
+            # 有多个安全轨迹时，主动选择离障碍物更远的，充分利用可用空间
+            cl_vals = [c['clearance'] for c in comfort_safe]
+            pd_vals = [c['path_dist'] for c in comfort_safe]
+            cl_min_v, cl_max_v = min(cl_vals), max(cl_vals)
+            pd_min_v, pd_max_v = min(pd_vals), max(pd_vals)
+            cl_r = cl_max_v - cl_min_v + 1e-6
+            pd_r = pd_max_v - pd_min_v + 1e-6
+            for c in comfort_safe:
+                cl_norm = (c['clearance'] - cl_min_v) / cl_r       # 0(最贴边) ~ 1(最开阔)
+                pd_norm = 1.0 - (c['path_dist'] - pd_min_v) / pd_r  # 0(最远) ~ 1(最近)
+                c['score'] = pd_norm * 0.6 + cl_norm * 0.4  # 60%跟路径 + 40%远离障碍
+            best = max(comfort_safe, key=lambda c: c['score'])
         elif tight_ok:
             # 紧贴模式 → 综合评分：clearance(60%) + path_dist(40%)
             # 纯两段筛选会让 path_dist 压制 clearance → 不绕行
@@ -818,10 +848,10 @@ class Navigator:
 
         # ---- 紧贴模式降速：按 clearance 比例，越靠近硬边界越慢 ----
         if best.get('comfort_collision', False):
-            # clearance ∈ [-175, 0] (舒适边界→硬边界)
-            # 映射到 speed ∈ [0.3, 0.8]，窄道居中时可到 0.5-0.7
+            # clearance ∈ [-COMFORT_MARGIN, 0] (舒适边界→硬边界)
+            # 映射到 speed ∈ [0.5, 1.0]，窄道中更快通过（原 0.3~0.8）
             cl = max(-COMFORT_MARGIN, min(0.0, best['clearance']))
-            speed_scale = 0.3 + 0.5 * (cl + COMFORT_MARGIN) / COMFORT_MARGIN
+            speed_scale = 0.5 + 0.5 * (cl + COMFORT_MARGIN) / COMFORT_MARGIN
             vx *= speed_scale
             vy *= speed_scale
 
@@ -830,15 +860,26 @@ class Navigator:
         vy = max(-self.MAX_VY, min(self.MAX_VY, vy))
         vw = max(-self.MAX_VW, min(self.MAX_VW, vw))
 
-        # ---- 低通滤波平滑 ----
+        # ---- 低通滤波平滑 + 输出变化率限制（防突然加速）----
         if not hasattr(self, '_last_dwa_vx'):
             self._last_dwa_vx = base_vx
             self._last_dwa_vy = base_vy
             self._last_dwa_vw = base_vw
-        alpha = 0.5
-        vx = alpha * vx + (1 - alpha) * self._last_dwa_vx
-        vy = alpha * vy + (1 - alpha) * self._last_dwa_vy
-        vw = alpha * vw + (1 - alpha) * self._last_dwa_vw
+        alpha = 0.3  # 更强的平滑（原 0.5→0.3）
+        vx_smooth = alpha * vx + (1 - alpha) * self._last_dwa_vx
+        vy_smooth = alpha * vy + (1 - alpha) * self._last_dwa_vy
+        vw_smooth = alpha * vw + (1 - alpha) * self._last_dwa_vw
+
+        # 输出变化率限制：单周期最大变化量（防突然加速/急转）
+        max_dv = 80.0    # mm/s² 等效 (80mm/s / 0.1s 控制周期)
+        max_dw = 0.25    # rad/s²
+        dvx = vx_smooth - self._last_dwa_vx
+        dvy = vy_smooth - self._last_dwa_vy
+        dvw = vw_smooth - self._last_dwa_vw
+        vx = self._last_dwa_vx + max(-max_dv, min(max_dv, dvx))
+        vy = self._last_dwa_vy + max(-max_dv, min(max_dv, dvy))
+        vw = self._last_dwa_vw + max(-max_dw, min(max_dw, dvw))
+
         self._last_dwa_vx = vx
         self._last_dwa_vy = vy
         self._last_dwa_vw = vw
@@ -956,12 +997,15 @@ class Navigator:
 
         # DWA 避障：安全过滤 + 路径跟踪选择
         if self._dw_enabled and dist_to_goal >= 200.0:
-            vx, vy, vw = self._dynamic_window_avoidance(
-                x, y, theta, base_vx, base_vy, base_vw)
             if obstacle_level == "EMERGENCY":
+                # 紧急：跳过 DWA 采样，直接搜索安全逃离方向
+                vx, vy, vw = self._evade_obstacle(x, y, theta)
                 self.state = "EVADE_EMERGENCY"
-            elif obstacle_level == "CAUTION":
-                self.state = "AVOIDING"
+            else:
+                vx, vy, vw = self._dynamic_window_avoidance(
+                    x, y, theta, base_vx, base_vy, base_vw)
+                if obstacle_level == "CAUTION":
+                    self.state = "AVOIDING"
         else:
             vx, vy, vw = base_vx, base_vy, base_vw
 
@@ -1032,7 +1076,7 @@ class Navigator:
             dx = wx - x
             dy = wy - y
             dist = math.hypot(dx, dy)
-            if dist > 2000 or dist < 100:
+            if dist > 2000 or dist < 20:  # 只过滤 20mm 内自身反射
                 continue
             angle = self._normalize_angle(math.atan2(dy, dx) - theta)
             # 扩大到 ±70°，确保能检测到正前方障碍物
@@ -1425,7 +1469,7 @@ class Navigator:
             if left_wall < float('inf') and right_wall < float('inf'):
                 channel_width = left_wall + right_wall
                 if channel_width < 400:
-                    channel_scale = max(0.3, channel_width / 400.0)
+                    channel_scale = max(0.4, channel_width / 400.0)
                     max_vx *= channel_scale
                     max_vy *= channel_scale
                     if channel_width < 350:
@@ -1668,8 +1712,7 @@ class Navigator:
             # 全向底盘允许后退，不再强制截断负vx
             vw = 0.0
             print(f"[EVADE] 选择方向={math.degrees(best_dir):.0f}° vx={vx:.0f} vy={vy:.0f}")
-
-        return vx, vy, vw
+            return vx, vy, vw
 
         # 所有方向都不安全，慢速后退作为最后手段
         print("[EVADE] 所有方向受阻，慢速后退")
