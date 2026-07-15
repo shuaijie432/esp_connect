@@ -37,7 +37,7 @@ class Navigator:
 
         # ★ A* 硬膨胀 = 16格 = 160mm（略小于 DWA 碰撞半宽 175mm，由代价梯度补足）
         # DWA碰撞半宽 = robot_radius(125) + channel_margin(50) = 175mm
-        self.obstacle_margin = 16
+        self.obstacle_margin = 8
 
         # ★ DWA 碰撞框参数
         # 碰撞半宽 = robot_radius(125) + channel_margin = 175mm，框宽350mm

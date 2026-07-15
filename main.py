@@ -303,7 +303,7 @@ class MainWindow(QMainWindow):
     def _on_java_nav_trigger(self):
         """Java MQTT触发导航 → (1300, -175) @ 90°"""
         print("[JAVA_NAV] 触发导航 -> (1300, -270) @ 90°")
-        self.target_x.setText("1300")
+        self.target_x.setText("1340")
         self.target_y.setText("-270")
         self.target_theta_deg.setText("95")
         self._is_java_nav = True
@@ -332,8 +332,8 @@ class MainWindow(QMainWindow):
 
     def _on_ws_cmd_5(self):
         """前端 WebSocket 发送 "5" → 触发导航（帧数>30后由前端确认启动）"""
-        print("[WS_CMD_5] 前端触发 → 导航至 (400, -90) @ 0°")
-        self.target_x.setText("380")
+        print("[WS_CMD_5] 前端触发 → 导航至 (420, -90) @ 0°")
+        self.target_x.setText("420")
         self.target_y.setText("-90")
         self.target_theta_deg.setText("-5")
         self.navigator._nav_count = 0  # 确保作为首次导航，走起点保护流程
@@ -783,7 +783,7 @@ class MainWindow(QMainWindow):
         if self._need_replan:
             self._need_replan = False
             # 冷却时间：5秒内不重复重规划，避免 A* 阻塞主线程导致 DWA 和雷达处理延迟
-            if now - self._last_replan_time < 5.0:
+            if now - self._last_replan_time < 1.0:
                 pass  # 跳过，等冷却
             elif self.navigator.waypoints:
                 target = self.navigator.waypoints[-1]
