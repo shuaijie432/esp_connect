@@ -285,8 +285,11 @@ class MainWindow(QMainWindow):
         self._is_java_nav = False      # MQTT "2" 触发的导航，对齐完成后不发 OpenMV
         self._is_openmv_nav = False   # OpenMV 0xA2 触发的导航，完成后发 "1" 给 OpenMV
         self._openmv_a2_count = 0     # 0xA2 接收计数：第1次→(1170,-1520)，第2次→(25,30)
-        self._suppress_lidar = False  # WS_CMD_5 导航完成后→_on_nav_zero_trigger 之前，抑制雷达点云
+        self._suppress_lidar = False  # WS_CMD_5完成后→NAV_ZERO完成前 以及 NAV_ZERO完成后→WS_CMD_6前，抑制雷达点云
         self._ws_cmd_5_active = False # 标记 WS_CMD_5 导航正在进行中
+        self._nav_zero_active = False # 标记 NAV_ZERO 导航进行中，完成后抑制雷达直到 WS_CMD_6
+        self._ws_cmd_6_active = False # 标记 WS_CMD_6 导航进行中，完成后抑制雷达直到 JAVA_NAV
+        self._java_nav_active = False # 标记 JAVA_NAV 导航进行中，完成后抑制雷达直到 OpenMV 0xA2
 
         # ---- 点位文件顺序导航 ----
         self._waypoint_list = []       # 从JSON加载的点位列表
@@ -299,12 +302,14 @@ class MainWindow(QMainWindow):
 
     def _on_java_nav_trigger(self):
         """Java MQTT触发导航 → (1300, -175) @ 90°"""
-        print("[JAVA_NAV] 触发导航 -> (1250, -50) @ 90°")
-        self.target_x.setText("1290")
-        self.target_y.setText("-250")
-        self.target_theta_deg.setText("90")
+        print("[JAVA_NAV] 触发导航 -> (1300, -270) @ 90°")
+        self.target_x.setText("1300")
+        self.target_y.setText("-270")
+        self.target_theta_deg.setText("95")
         self._is_java_nav = True
-        self.navigator.final_approach_dist = 300.0
+        self._java_nav_active = True  # 标记 JAVA_NAV 导航，完成后抑制雷达直到 OpenMV 0xA2
+        self._suppress_lidar = False  # 恢复雷达点云接收与绘制
+        self.navigator.final_approach_dist = 100.0
         self.navigator.safety_boost = 10.0  # 碰撞框额外扩大60mm
         if self.ws_server:
             self.ws_server.send_text("2")
@@ -317,6 +322,7 @@ class MainWindow(QMainWindow):
         self.target_y.setText("-1395")
         self.target_theta_deg.setText("-90")
         self._is_java_nav = True
+        self._nav_zero_active = True   # 标记 NAV_ZERO 导航，完成后抑制雷达直到 WS_CMD_6
         self._suppress_lidar = False  # 恢复雷达点云接收与绘制
         self.navigator.final_approach_dist = 300.0
         self.navigator.safety_boost = 3.0  # 碰撞框额外扩大60mm
@@ -329,7 +335,7 @@ class MainWindow(QMainWindow):
         print("[WS_CMD_5] 前端触发 → 导航至 (400, -90) @ 0°")
         self.target_x.setText("380")
         self.target_y.setText("-90")
-        self.target_theta_deg.setText("-10")
+        self.target_theta_deg.setText("-5")
         self.navigator._nav_count = 0  # 确保作为首次导航，走起点保护流程
         self._ws_cmd_5_active = True
         self.start_navigation()
@@ -340,6 +346,8 @@ class MainWindow(QMainWindow):
         self.target_x.setText("1170")
         self.target_y.setText("-1520")
         self.target_theta_deg.setText("-180")
+        self._suppress_lidar = False  # 恢复雷达点云接收与绘制
+        self._ws_cmd_6_active = True  # 标记 WS_CMD_6 导航，完成后抑制雷达直到 JAVA_NAV
         self.start_navigation()
 
     def _on_openmv_data(self, data: bytes):
@@ -370,6 +378,7 @@ class MainWindow(QMainWindow):
                     self.target_y.setText(ty)
                     self.target_theta_deg.setText(tdeg)
                     self._is_openmv_nav = True
+                    self._suppress_lidar = False  # 恢复雷达点云接收与绘制
                     self.start_navigation()
             elif cmd == 0x02:
                 self.openmv_label.setText(f"OpenMV: 收到指令 0x02")
@@ -719,6 +728,33 @@ class MainWindow(QMainWindow):
                 elif self.navigator.state == "DONE" and self._is_java_nav:
                     self.send_last_waypoint_frame()
                     self._is_java_nav = False
+
+                # ---- MQTT "0" (NAV_ZERO) 导航完成 → 抑制雷达点云，等待 WS_CMD_6 ----
+                if self._nav_zero_active and self.navigator.state == "DONE":
+                    self._suppress_lidar = True
+                    self._nav_zero_active = False
+                    with self.mapper.lock:
+                        self.mapper.latest_points_local = []
+                        self.mapper.latest_points_world = []
+                    print("[LIDAR] NAV_ZERO 导航完成，开始抑制雷达点云接收与绘制（等待 WS_CMD_6 触发）")
+
+                # ---- WS_CMD_6 导航完成 → 抑制雷达点云，等待 JAVA_NAV ----
+                if self._ws_cmd_6_active and self.navigator.state == "DONE":
+                    self._suppress_lidar = True
+                    self._ws_cmd_6_active = False
+                    with self.mapper.lock:
+                        self.mapper.latest_points_local = []
+                        self.mapper.latest_points_world = []
+                    print("[LIDAR] WS_CMD_6 导航完成，开始抑制雷达点云接收与绘制（等待 JAVA_NAV 触发）")
+
+                # ---- JAVA_NAV 导航完成 → 抑制雷达点云，等待 OpenMV 0xA2 ----
+                if self._java_nav_active and self.navigator.state == "DONE":
+                    self._suppress_lidar = True
+                    self._java_nav_active = False
+                    with self.mapper.lock:
+                        self.mapper.latest_points_local = []
+                        self.mapper.latest_points_world = []
+                    print("[LIDAR] JAVA_NAV 导航完成，开始抑制雷达点云接收与绘制（等待 OpenMV 0xA2 触发）")
 
                 # ---- OpenMV 0xA2 导航完成 → 发 "0" 给 WebSocket ----
                 elif self.navigator.state == "DONE" and self._is_openmv_nav:

@@ -1203,7 +1203,7 @@ class Navigator:
         abs_diff = abs(angle_diff)
         now = time.time()
 
-        if abs_diff >= math.radians(10.0):
+        if abs_diff >= math.radians(5.0):
             self._align_settle_until = 0.0
             self._alignment_ack_sent = False
             self._align_stable_count = 0
