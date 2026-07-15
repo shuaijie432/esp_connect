@@ -798,11 +798,15 @@ class Navigator:
                             break
 
                     path_dist = math.hypot(target[0] - px, target[1] - py) if target else 0.0
+                    # 路径垂直偏差：预测终点到全局路径线的最短距离
+                    # 障碍物绕过后，此项惩罚横向偏移，拉机器人回到路径上
+                    path_dev = self._calc_path_deviation(px, py) if self.waypoints and len(self.waypoints) >= 2 else 0.0
 
                     cand = {'vx': cvx, 'vy': cvy, 'vw': cvw,
                             'hard_collision': hard_collision,
                             'comfort_collision': comfort_collision,
-                            'clearance': min_cl, 'path_dist': path_dist}
+                            'clearance': min_cl, 'path_dist': path_dist,
+                            'path_dev': path_dev}
                     all_cands.append(cand)
 
                     if not hard_collision:
@@ -812,31 +816,39 @@ class Navigator:
 
         # ---- 选择最优轨迹 ----
         if comfort_safe:
-            # 开阔空间：综合评分 = 路径距离(60%) + 远离障碍物(40%)
-            # 有多个安全轨迹时，主动选择离障碍物更远的，充分利用可用空间
+            # 开阔空间：综合评分 = 路径距离(50%) + 路径偏差(25%) + 远离障碍物(25%)
+            # 障碍物绕过之后，path_dev 项会把机器人拉回全局路径线，避免过度绕行
             cl_vals = [c['clearance'] for c in comfort_safe]
             pd_vals = [c['path_dist'] for c in comfort_safe]
+            dev_vals = [c['path_dev'] for c in comfort_safe]
             cl_min_v, cl_max_v = min(cl_vals), max(cl_vals)
             pd_min_v, pd_max_v = min(pd_vals), max(pd_vals)
+            dev_min_v, dev_max_v = min(dev_vals), max(dev_vals)
             cl_r = cl_max_v - cl_min_v + 1e-6
             pd_r = pd_max_v - pd_min_v + 1e-6
+            dev_r = dev_max_v - dev_min_v + 1e-6
             for c in comfort_safe:
-                cl_norm = (c['clearance'] - cl_min_v) / cl_r       # 0(最贴边) ~ 1(最开阔)
+                cl_norm = (c['clearance'] - cl_min_v) / cl_r        # 0(最贴边) ~ 1(最开阔)
                 pd_norm = 1.0 - (c['path_dist'] - pd_min_v) / pd_r  # 0(最远) ~ 1(最近)
-                c['score'] = pd_norm * 0.6 + cl_norm * 0.4  # 60%跟路径 + 40%远离障碍
+                dev_norm = 1.0 - (c['path_dev'] - dev_min_v) / dev_r  # 0(最偏) ~ 1(贴路径)
+                c['score'] = pd_norm * 0.50 + dev_norm * 0.25 + cl_norm * 0.25
             best = max(comfort_safe, key=lambda c: c['score'])
         elif tight_ok:
-            # 紧贴模式 → 综合评分：clearance(60%) + path_dist(40%)
-            # 纯两段筛选会让 path_dist 压制 clearance → 不绕行
+            # 紧贴模式 → 综合评分：clearance(40%) + path_dist(30%) + path_dev(30%)
+            # 窄道中也要有路径偏差项，绕过后尽快回到路径
             cl_vals = [c['clearance'] for c in tight_ok]
             pd_vals = [c['path_dist'] for c in tight_ok]
+            dev_vals = [c['path_dev'] for c in tight_ok]
             cl_min, cl_max = min(cl_vals), max(cl_vals)
             pd_min, pd_max = min(pd_vals), max(pd_vals)
+            dev_min, dev_max = min(dev_vals), max(dev_vals)
             cl_r = cl_max - cl_min + 1e-6
             pd_r = pd_max - pd_min + 1e-6
+            dev_r = dev_max - dev_min + 1e-6
             for c in tight_ok:
-                c['score'] = (c['clearance'] - cl_min) / cl_r * 0.6 \
-                           + (1.0 - (c['path_dist'] - pd_min) / pd_r) * 0.4
+                c['score'] = (c['clearance'] - cl_min) / cl_r * 0.40 \
+                           + (1.0 - (c['path_dist'] - pd_min) / pd_r) * 0.30 \
+                           + (1.0 - (c['path_dev'] - dev_min) / dev_r) * 0.30
             best = max(tight_ok, key=lambda c: c['score'])
         elif all_cands:
             # 全部碰撞 → 选 clearance 最好的
@@ -865,7 +877,7 @@ class Navigator:
             self._last_dwa_vx = base_vx
             self._last_dwa_vy = base_vy
             self._last_dwa_vw = base_vw
-        alpha = 0.3  # 更强的平滑（原 0.5→0.3）
+        alpha = 0.50  # 降低平滑惯性（原0.3），绕行后更快回归路径
         vx_smooth = alpha * vx + (1 - alpha) * self._last_dwa_vx
         vy_smooth = alpha * vy + (1 - alpha) * self._last_dwa_vy
         vw_smooth = alpha * vw + (1 - alpha) * self._last_dwa_vw
@@ -1491,7 +1503,7 @@ class Navigator:
 
         # 路径回归约束（极轻量，DWA 避障后有自然回归趋势即可）
         path_lateral_err, path_proj = self._calc_path_projection(x, y)
-        regress_gain = 0.3 if channel_width < 450 else 0.5
+        regress_gain = 0.5 if channel_width < 450 else 0.7  # 提高回归力(原0.3/0.5)，绕行后更快回到路径
         if abs(path_lateral_err) > 10.0 and len(self.waypoints) > 2:
             reg_dx = path_proj[0] - x
             reg_dy = path_proj[1] - y
