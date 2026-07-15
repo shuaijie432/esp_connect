@@ -40,11 +40,11 @@ class MapWidget(QWidget):
         # ===== 叠加图片（世界坐标 mm，可自行调整）====
         self._overlay_pixmap = QPixmap("2.jpg")
         self.overlay_img_center = (420, -430)       # 图片中心位置 (世界坐标 mm)
-        self.overlay_img_size_mm = (250, 250)  # 图片显示大小 (宽, 高) mm
+        self.overlay_img_size_mm = (0, 0)  # 图片显示大小 (宽, 高) mm
 
         self._overlay_pixmap2 = QPixmap("3.jpg")
         self.overlay_img_center2 = (1220, -1180)      # 图片中心位置 (世界坐标 mm)
-        self.overlay_img_size_mm2 = (250, 250) # 图片显示大小 (宽, 高) mm
+        self.overlay_img_size_mm2 = (0, 0) # 图片显示大小 (宽, 高) mm
 
         # 启用鼠标追踪以支持点击导航
         self.setMouseTracking(True)
