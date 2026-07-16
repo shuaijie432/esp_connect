@@ -1310,7 +1310,7 @@ class Navigator:
         max_vy = self.MAX_VY
         max_vw = self.MAX_VW
 
-        if is_final and dist < 800:
+        if is_final and dist < 400:
             scale = max(0.15, dist / 800.0)
             max_vx *= scale
             max_vy *= scale
@@ -1360,8 +1360,8 @@ class Navigator:
             if left_wall < float('inf') and right_wall < float('inf'):
                 channel_width = left_wall + right_wall
 
-                if channel_width < 500:
-                    channel_scale = max(0.30, channel_width / 500.0)
+                if channel_width < 450:
+                    channel_scale = max(0.50, channel_width / 450.0)
                     max_vx *= channel_scale
                     max_vy *= channel_scale
 

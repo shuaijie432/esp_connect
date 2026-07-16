@@ -228,7 +228,7 @@ class LidarMapper:
 
         for i, pt in enumerate(points_sorted):
             # 严格距离范围
-            if pt.distance < 200:
+            if pt.distance < 100:
                 continue
             if pt.distance > 3500:
                 continue
