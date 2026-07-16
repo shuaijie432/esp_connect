@@ -25,8 +25,8 @@ class Navigator:
         self.final_threshold = 40.0
 
         # 机器人物理尺寸（mm）
-        self.robot_width_mm = 250.0           # 27cm 车身宽度
-        self.robot_length_mm = 250.0          # 27cm 车身长度
+        self.robot_width_mm = 260.0           # 27cm 车身宽度
+        self.robot_length_mm = 260.0          # 27cm 车身长度
         self.robot_radius_mm = self.robot_width_mm / 2.0   # 125mm
         self.safety_margin_mm = 80.0           # DWA 额外安全余量
         self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 175mm
@@ -62,9 +62,10 @@ class Navigator:
         self._plan_frozen = False
 
         # 速度参数
-        self.MAX_VX = 250.0
-        self.MAX_VY = 180.0
+        self.MAX_VX = 170.0
+        self.MAX_VY = 130.0
         self.MAX_VW = 0.4
+
         self.KP_V = 0.5
         self.KP_W = 0.9
 
@@ -914,6 +915,13 @@ class Navigator:
                 vx *= ramp
                 vy *= ramp
                 vw *= ramp
+
+        # 合速度不低于80mm/s（合速度不为零但低于阈值时，按比例放大）
+        speed = math.hypot(vx, vy)
+        if speed > 0.01 and speed < 80.0:
+            scale = 80.0 / speed
+            vx *= scale
+            vy *= scale
 
         return vx, vy, vw
 

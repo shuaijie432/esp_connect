@@ -303,8 +303,8 @@ class MainWindow(QMainWindow):
     def _on_java_nav_trigger(self):
         """Java MQTT触发导航 → (1300, -175) @ 90°"""
         print("[JAVA_NAV] 触发导航 -> (1300, -270) @ 90°")
-        self.target_x.setText("1340")
-        self.target_y.setText("-270")
+        self.target_x.setText("1330")
+        self.target_y.setText("-280")
         self.target_theta_deg.setText("95")
         self._is_java_nav = True
         self._java_nav_active = True  # 标记 JAVA_NAV 导航，完成后抑制雷达直到 OpenMV 0xA2
@@ -318,13 +318,13 @@ class MainWindow(QMainWindow):
     def _on_nav_zero_trigger(self):
         """MQTT "0" 触发导航 → (350, -1450) @ -90°"""
         print("[NAV_ZERO] 触发导航 -> (320, -1395) @ -90°")
-        self.target_x.setText("320")
-        self.target_y.setText("-1395")
+        self.target_x.setText("330")
+        self.target_y.setText("-1350")
         self.target_theta_deg.setText("-90")
         self._is_java_nav = True
         self._nav_zero_active = True   # 标记 NAV_ZERO 导航，完成后抑制雷达直到 WS_CMD_6
         self._suppress_lidar = False  # 恢复雷达点云接收与绘制
-        self.navigator.final_approach_dist = 300.0
+        self.navigator.final_approach_dist = 100.0
         self.navigator.safety_boost = 3.0  # 碰撞框额外扩大60mm
         if self.ws_server:
             self.ws_server.send_text("1")
@@ -623,7 +623,7 @@ class MainWindow(QMainWindow):
         frame.append(0xA2)
         checksum = sum(frame[2:]) & 0xFF
         frame.append(checksum)
-        frame.append(0xBB)
+        frame.append(0xEE)
 
         try:
             self.client.publish(TOPIC_CONTROL, bytes(frame), qos=1)
@@ -866,10 +866,10 @@ class MainWindow(QMainWindow):
         if self.client is None or not self.client.is_connected():
             return
 
-        # 线速度最低 70mm/s：线速度不为零但低于阈值时，按比例放大
+        # 合速度不低于80mm/s（合速度不为零但低于阈值时，按比例放大）
         speed = math.hypot(vx, vy)
-        if speed > 0.01 and speed < 70.0:
-            scale = 70.0 / speed
+        if speed > 0.01 and speed < 80.0:
+            scale = 80.0 / speed
             vx *= scale
             vy *= scale
 
