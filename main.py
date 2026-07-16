@@ -368,7 +368,7 @@ class MainWindow(QMainWindow):
                         "font-size: 12px; line-height: 1.4; color: #ffcc00;"
                     )
                 else:
-                    tx, ty, tdeg = "25", "30", "0"
+                    tx, ty, tdeg = "95", "-60", "0"
                     print(f"[OPENMV] 第{self._openmv_a2_count}次收到 0xA2 → 导航至 ({tx}, {ty}) @ {tdeg}°")
                     self.openmv_label.setText(f"OpenMV: 0xA2 (#{self._openmv_a2_count}) → ({tx}, {ty})")
                     self.openmv_label.setStyleSheet(
@@ -865,6 +865,13 @@ class MainWindow(QMainWindow):
     def send_velocity_command(self, vx: float, vy: float, vw: float):
         if self.client is None or not self.client.is_connected():
             return
+
+        # 线速度最低 70mm/s：线速度不为零但低于阈值时，按比例放大
+        speed = math.hypot(vx, vy)
+        if speed > 0.01 and speed < 70.0:
+            scale = 70.0 / speed
+            vx *= scale
+            vy *= scale
 
         try:
             import struct

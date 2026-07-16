@@ -28,7 +28,7 @@ class Navigator:
         self.robot_width_mm = 250.0           # 27cm 车身宽度
         self.robot_length_mm = 250.0          # 27cm 车身长度
         self.robot_radius_mm = self.robot_width_mm / 2.0   # 125mm
-        self.safety_margin_mm = 50.0           # DWA 额外安全余量
+        self.safety_margin_mm = 80.0           # DWA 额外安全余量
         self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 175mm
 
         # ★ A* 硬膨胀 = 15格 = 150mm（明确大于机器人半径125mm）
@@ -62,11 +62,11 @@ class Navigator:
         self._plan_frozen = False
 
         # 速度参数
-        self.MAX_VX = 150.0
-        self.MAX_VY = 80.0
+        self.MAX_VX = 250.0
+        self.MAX_VY = 180.0
         self.MAX_VW = 0.4
         self.KP_V = 0.5
-        self.KP_W = 1.4
+        self.KP_W = 0.9
 
         self._coord_checked = False
 
