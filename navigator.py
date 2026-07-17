@@ -27,15 +27,18 @@ class Navigator:
         # 机器人物理尺寸（mm）
         self.robot_width_mm = 260.0           # 27cm 车身宽度
         self.robot_length_mm = 260.0          # 27cm 车身长度
-        self.robot_radius_mm = self.robot_width_mm / 2.0   # 125mm
-        self.safety_margin_mm = 80.0           # DWA 额外安全余量
-        self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 175mm
+        self.robot_radius_mm = self.robot_width_mm / 2.0   # 130mm（半宽）
+        # 对角线半长 = sqrt(130²+130²) ≈ 184mm，A* 膨胀必须覆盖整个车身
+        self.robot_diag_half_mm = math.hypot(self.robot_width_mm / 2, self.robot_length_mm / 2)
+        self.safety_margin_mm = 100.0          # DWA 额外安全余量（80→100）
+        self.total_inflation_mm = self.robot_radius_mm + self.safety_margin_mm  # 230mm
 
-        # ★ A* 硬膨胀 = 15格 = 150mm（明确大于机器人半径125mm）
-        self.obstacle_margin = 15
+        # ★ A* 硬膨胀 = 22格 = 220mm（覆盖对角线半长184mm + 36mm余量）
+        #    确保车身蓝色方框的四个角也不会进入膨胀区
+        self.obstacle_margin = 22
 
         # ★ DWA 碰撞框参数
-        self.channel_margin_mm = 80.0
+        self.channel_margin_mm = 100.0        # 通道余量（80→100）
         self.replan_threshold = 200.0
 
         self.replan_interval = 1.0
@@ -62,7 +65,7 @@ class Navigator:
         self._plan_frozen = False
 
         # 速度参数
-        self.MAX_VX = 170.0
+        self.MAX_VX = 150.0
         self.MAX_VY = 130.0
         self.MAX_VW = 0.4
 
@@ -104,9 +107,9 @@ class Navigator:
 
         # 动态窗口避障参数
         self._dw_enabled = True
-        self._uniform_clearance = 200.0
-        self._dw_safe_distance = 150.0
-        self._dw_critical_distance = 100.0
+        self._uniform_clearance = 240.0         # 统一安全距离（200→240）
+        self._dw_safe_distance = 180.0          # 安全距离（150→180）
+        self._dw_critical_distance = 140.0      # 临界距离（100→140）
         self._dw_lateral_gain = 2.0
 
         # 卡住检测
@@ -116,6 +119,12 @@ class Navigator:
         self._stuck_dist_threshold = 200.0
         self._total_replan_count = 0
         self._max_replan = 999
+
+        # 合速度速率限制器（防止突变）
+        self._last_output_speed = 0.0           # 上一帧下发的合速度
+        self.MIN_COMBINED_SPEED = 70.0          # 最低合速度 mm/s
+        self.MAX_SPEED_DELTA = 35.0             # 每步最大加速量 (100ms步长 → 350mm/s²)
+        self.MAX_SPEED_DELTA_BRAKE = 60.0       # 每步最大减速量 (允许更快刹车)
 
         # 起点保护
         self._startup_align_phase = 2
@@ -605,7 +614,7 @@ class Navigator:
         phys_hl = self.robot_length_mm / 2.0 + PHYS_MARGIN
         phys_hw = self.robot_width_mm / 2.0 + PHYS_MARGIN
 
-        COMFORT_MARGIN = 175.0
+        COMFORT_MARGIN = 220.0     # DWA 舒适框余量（175→220，匹配 A* 膨胀）
         comfort_hl = phys_hl + COMFORT_MARGIN
         comfort_hw = phys_hw + COMFORT_MARGIN
 
@@ -886,11 +895,11 @@ class Navigator:
         self.state = "FOLLOWING"
         base_vx, base_vy, base_vw = self._pure_pursuit_step(x, y, theta)
 
-        if front_dist < 250.0:
-            speed_scale = max(0.15, (front_dist - 80.0) / 170.0)
+        if front_dist < 350.0:
+            speed_scale = max(0.15, (front_dist - 120.0) / 230.0)
             base_vx = base_vx * speed_scale
             base_vy = base_vy * speed_scale
-            if front_dist < 150.0:
+            if front_dist < 220.0:
                 print(f"[BRAKE] 前方障碍物 {front_dist:.0f}mm，速度缩放至 {speed_scale:.2f}")
 
         dist_to_goal = math.hypot(self.waypoints[-1][0] - x, self.waypoints[-1][1] - y) \
@@ -908,20 +917,43 @@ class Navigator:
         else:
             vx, vy, vw = base_vx, base_vy, base_vw
 
-        if getattr(self, '_nav_start_time', 0) > 0:
-            elapsed = now - self._nav_start_time
-            if elapsed < 2.0:
-                ramp = 0.3 + 0.7 * (elapsed / 2.0)
-                vx *= ramp
-                vy *= ramp
-                vw *= ramp
-
-        # 合速度不低于80mm/s（合速度不为零但低于阈值时，按比例放大）
+        # ============================================================
+        # 合速度平滑限幅：保证 ≥85mm/s 且不会突变
+        # ============================================================
         speed = math.hypot(vx, vy)
-        if speed > 0.01 and speed < 80.0:
-            scale = 80.0 / speed
-            vx *= scale
-            vy *= scale
+
+        if speed > 0.01:
+            # 1. 强制最低合速度
+            if speed < self.MIN_COMBINED_SPEED:
+                scale = self.MIN_COMBINED_SPEED / speed
+                vx *= scale
+                vy *= scale
+                speed = self.MIN_COMBINED_SPEED
+
+            # 2. 速率限制器：防止相邻两帧合速度突变
+            delta = speed - self._last_output_speed
+
+            # 加速上限
+            max_delta = self.MAX_SPEED_DELTA
+            # 减速上限（允许更快刹车）
+            max_brake = self.MAX_SPEED_DELTA_BRAKE
+
+            if delta > max_delta:
+                speed = self._last_output_speed + max_delta
+            elif delta < -max_brake:
+                speed = self._last_output_speed - max_brake
+
+            if speed > 0.01:
+                old_speed = math.hypot(vx, vy)
+                if old_speed > 0.01:
+                    scale = speed / old_speed
+                    vx *= scale
+                    vy *= scale
+
+            self._last_output_speed = speed
+        else:
+            # 输出为零（停止），允许立刻降为零
+            self._last_output_speed = 0.0
 
         return vx, vy, vw
 
@@ -1019,6 +1051,13 @@ class Navigator:
         self._startup_align_phase = 2
         self._startup_align_stable = 0
 
+        # 重置速度状态，确保新导航从零开始平滑加速
+        self._last_output_speed = 0.0
+        if hasattr(self, '_last_dwa_vx'):
+            del self._last_dwa_vx
+            del self._last_dwa_vy
+            del self._last_dwa_vw
+
         print(f"[NAV] 目标已设置: ({x:.0f}, {y:.0f}), 路径点: {len(self.waypoints)}个, 规划已冻结")
         return True
 
@@ -1038,6 +1077,12 @@ class Navigator:
         self.final_approach_dist = 0.0
         self.safety_boost = 0.0
         self._nav_start_time = 0.0
+        # 重置速度状态，防止下次导航继承旧速度
+        self._last_output_speed = 0.0
+        if hasattr(self, '_last_dwa_vx'):
+            del self._last_dwa_vx
+            del self._last_dwa_vy
+            del self._last_dwa_vw
         self._unfreeze_planning_map()
         print("[NAV] 导航已取消，规划地图已解冻")
 
@@ -1095,16 +1140,10 @@ class Navigator:
             self._alignment_ack_sent = False
             self._align_stable_count = 0
 
-            align_KP = 0.7
-
-            if abs_diff < math.radians(20.0):
-                scale = abs_diff / math.radians(20.0)
-                vw_cap = self.MAX_VW * 0.25 + self.MAX_VW * 0.75 * scale
-            else:
-                vw_cap = self.MAX_VW
-
-            vw_raw = align_KP * angle_diff
-            vw = max(-vw_cap, min(vw_cap, vw_raw))
+            # 固定角速度 10°/s，方向由偏差符号决定
+            vw = math.radians(10.0)
+            if angle_diff < 0:
+                vw = -vw
             return 0.0, 0.0, vw
 
         if self._align_stable_count < 3:
@@ -1368,8 +1407,8 @@ class Navigator:
             if left_wall < float('inf') and right_wall < float('inf'):
                 channel_width = left_wall + right_wall
 
-                if channel_width < 450:
-                    channel_scale = max(0.50, channel_width / 450.0)
+                if channel_width < 550:
+                    channel_scale = max(0.50, channel_width / 550.0)
                     max_vx *= channel_scale
                     max_vy *= channel_scale
 
@@ -1398,31 +1437,31 @@ class Navigator:
                             tight_scale = max(0.18, min_fwd_passage / min_safe_width)
                             max_vx *= tight_scale
                             max_vy *= tight_scale
-                            if min_fwd_passage < 350:
+                            if min_fwd_passage < 420:
                                 print(f"[CHANNEL] 前方极窄{min_fwd_passage:.0f}mm < 安全{min_safe_width:.0f}mm "
                                       f"中心偏移{fwd_center_offset:.0f}mm 大幅降速至{tight_scale:.2f}")
 
-                    if channel_width < 400:
+                    if channel_width < 500:
                         fwd_str = f" 前方最窄{min_fwd_passage:.0f}mm" if fwd_valid else ""
                         print(f"[CHANNEL] 窄道{channel_width:.0f}mm L={left_wall:.0f} R={right_wall:.0f}"
                               f"{fwd_str} 降速{channel_scale:.2f} 侧移{_channel_lateral_shift:.0f}")
 
-            elif left_wall < float('inf') and left_wall < 350:
-                right_open = (right_wall == float('inf') or right_wall > 600)
+            elif left_wall < float('inf') and left_wall < 450:
+                right_open = (right_wall == float('inf') or right_wall > 700)
                 if right_open:
-                    shift_mag = min(70.0, max(30.0, (350.0 - left_wall) * 0.55))
+                    shift_mag = min(70.0, max(30.0, (450.0 - left_wall) * 0.55))
                     _channel_lateral_shift = -shift_mag
                     print(f"[SIDE] 左侧贴墙{left_wall:.0f}mm 右侧开阔 → 大幅右移 vy={_channel_lateral_shift:.0f}")
                 else:
-                    _channel_lateral_shift = -min(40.0, (350.0 - left_wall) * 0.35)
-            elif right_wall < float('inf') and right_wall < 350:
-                left_open = (left_wall == float('inf') or left_wall > 600)
+                    _channel_lateral_shift = -min(40.0, (450.0 - left_wall) * 0.35)
+            elif right_wall < float('inf') and right_wall < 450:
+                left_open = (left_wall == float('inf') or left_wall > 700)
                 if left_open:
-                    shift_mag = min(70.0, max(30.0, (350.0 - right_wall) * 0.55))
+                    shift_mag = min(70.0, max(30.0, (450.0 - right_wall) * 0.55))
                     _channel_lateral_shift = shift_mag
                     print(f"[SIDE] 右侧贴墙{right_wall:.0f}mm 左侧开阔 → 大幅左移 vy={_channel_lateral_shift:.0f}")
                 else:
-                    _channel_lateral_shift = min(40.0, (350.0 - right_wall) * 0.35)
+                    _channel_lateral_shift = min(40.0, (450.0 - right_wall) * 0.35)
 
         vx_raw = kp_v * local_x
 
@@ -1446,14 +1485,14 @@ class Navigator:
                 vy *= ratio
 
         path_lateral_err, path_proj = self._calc_path_projection(x, y)
-        regress_gain = 0.5 if channel_width < 450 else 0.7
+        regress_gain = 0.5 if channel_width < 550 else 0.7
         if abs(path_lateral_err) > 10.0 and len(self.waypoints) > 2:
             reg_dx = path_proj[0] - x
             reg_dy = path_proj[1] - y
             reg_dist = math.hypot(reg_dx, reg_dy)
             if reg_dist > 5:
                 vy_correction = -path_lateral_err * regress_gain
-                max_vy_correction = self.MAX_VY * 0.15 if channel_width < 450 else self.MAX_VY * 0.25
+                max_vy_correction = self.MAX_VY * 0.15 if channel_width < 550 else self.MAX_VY * 0.25
                 vy_correction = max(-max_vy_correction, min(max_vy_correction, vy_correction))
                 vy += vy_correction
 
@@ -1513,9 +1552,9 @@ class Navigator:
             else:
                 rear_min = min(rear_min, dist)
 
-        if front_min < 120 or left_min < 120 or right_min < 120:
+        if front_min < 180 or left_min < 180 or right_min < 180:
             return "EMERGENCY"
-        if front_min < 250 or left_min < 250 or right_min < 250 or rear_min < 250:
+        if front_min < 320 or left_min < 320 or right_min < 320 or rear_min < 320:
             return "CAUTION"
 
         return "CLEAR"
@@ -1556,13 +1595,13 @@ class Navigator:
             elif -110 < angle_deg <= -60:
                 right_min = min(right_min, dist)
 
-        if front_min > 350 and fleft_min > 300 and fright_min > 300:
-            if left_min < 200:
-                side_speed = min(80.0, max(30.0, (200.0 - left_min) * 0.5))
+        if front_min > 450 and fleft_min > 400 and fright_min > 400:
+            if left_min < 280:
+                side_speed = min(80.0, max(30.0, (280.0 - left_min) * 0.5))
                 print(f"[EVADE] 左侧障碍物 {left_min:.0f}mm，向右避让 vy={side_speed:.0f}")
                 return 60.0, -side_speed, 0.0
-            if right_min < 200:
-                side_speed = min(80.0, max(30.0, (200.0 - right_min) * 0.5))
+            if right_min < 280:
+                side_speed = min(80.0, max(30.0, (280.0 - right_min) * 0.5))
                 print(f"[EVADE] 右侧障碍物 {right_min:.0f}mm，向左避让 vy={side_speed:.0f}")
                 return 60.0, side_speed, 0.0
             base_vx, base_vy, base_vw = self._pure_pursuit_step(x, y, theta)
@@ -1573,13 +1612,13 @@ class Navigator:
         best_score = -float('inf')
 
         test_dirs = []
-        if front_min < 200:
+        if front_min < 280:
             for priority_offset in [90, -90, 75, -75, 60, -60, 45, -45, 30, -30, 15, -15, 0, 120, -120]:
                 test_dirs.append(self._normalize_angle(path_dir + math.radians(priority_offset)))
-        elif right_min < 200:
+        elif right_min < 280:
             for priority_offset in [90, 75, 60, 45, 30, 15, 0, -15, -30, -45, -60, -75, -90, 120, -120]:
                 test_dirs.append(self._normalize_angle(path_dir + math.radians(priority_offset)))
-        elif left_min < 200:
+        elif left_min < 280:
             for priority_offset in [-90, -75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75, 90, 120, -120]:
                 test_dirs.append(self._normalize_angle(path_dir + math.radians(priority_offset)))
         else:
@@ -1612,19 +1651,19 @@ class Navigator:
             dir_diff = abs(self._normalize_angle(test_rad - path_dir))
             score = 200 - math.degrees(dir_diff) * 1.2 + min_obstacle_dist * 0.05
 
-            if front_min < 300:
+            if front_min < 400:
                 side_component = abs(math.sin(test_rad))
                 score += side_component * 80
-            elif front_min < 450:
+            elif front_min < 550:
                 if abs(math.sin(test_rad)) > 0.5:
                     score += 30
-            if right_min < 350:
+            if right_min < 450:
                 if math.sin(test_rad) > 0:
-                    score += (350.0 - right_min) * 0.3
-            if left_min < 350:
+                    score += (450.0 - right_min) * 0.3
+            if left_min < 450:
                 if math.sin(test_rad) < 0:
-                    score += (350.0 - left_min) * 0.3
-            if right_min < 500 and left_min < 500:
+                    score += (450.0 - left_min) * 0.3
+            if right_min < 600 and left_min < 600:
                 asymmetry = right_min - left_min
                 score += math.sin(test_rad) * asymmetry * 0.2
 
@@ -1633,9 +1672,9 @@ class Navigator:
                 best_dir = test_rad
 
         if best_dir is not None:
-            if front_min < 300:
+            if front_min < 400:
                 speed = 80.0
-            elif front_min < 500:
+            elif front_min < 600:
                 speed = 150.0
             else:
                 speed = 120.0

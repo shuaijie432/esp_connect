@@ -303,8 +303,8 @@ class MainWindow(QMainWindow):
     def _on_java_nav_trigger(self):
         """Java MQTT触发导航 → (1300, -175) @ 90°"""
         print("[JAVA_NAV] 触发导航 -> (1300, -270) @ 90°")
-        self.target_x.setText("1330")
-        self.target_y.setText("-280")
+        self.target_x.setText("1320")
+        self.target_y.setText("-290")
         self.target_theta_deg.setText("95")
         self._is_java_nav = True
         self._java_nav_active = True  # 标记 JAVA_NAV 导航，完成后抑制雷达直到 OpenMV 0xA2
@@ -319,7 +319,7 @@ class MainWindow(QMainWindow):
         """MQTT "0" 触发导航 → (350, -1450) @ -90°"""
         print("[NAV_ZERO] 触发导航 -> (320, -1395) @ -90°")
         self.target_x.setText("330")
-        self.target_y.setText("-1350")
+        self.target_y.setText("-1310")
         self.target_theta_deg.setText("-90")
         self._is_java_nav = True
         self._nav_zero_active = True   # 标记 NAV_ZERO 导航，完成后抑制雷达直到 WS_CMD_6
