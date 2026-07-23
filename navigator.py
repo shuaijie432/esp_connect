@@ -122,7 +122,7 @@ class Navigator:
 
         # 合速度速率限制器（防止突变）
         self._last_output_speed = 0.0           # 上一帧下发的合速度
-        self.MIN_COMBINED_SPEED = 70.0          # 最低合速度 mm/s
+        self.MIN_COMBINED_SPEED = 65.0          # 最低合速度 mm/s
         self.MAX_SPEED_DELTA = 35.0             # 每步最大加速量 (100ms步长 → 350mm/s²)
         self.MAX_SPEED_DELTA_BRAKE = 60.0       # 每步最大减速量 (允许更快刹车)
 
@@ -1135,13 +1135,13 @@ class Navigator:
         abs_diff = abs(angle_diff)
         now = time.time()
 
-        if abs_diff >= math.radians(5.0):
+        if abs_diff >= math.radians(8.0):
             self._align_settle_until = 0.0
             self._alignment_ack_sent = False
             self._align_stable_count = 0
 
-            # 固定角速度 10°/s，方向由偏差符号决定
-            vw = math.radians(10.0)
+            # 固定角速度 8°/s，方向由偏差符号决定
+            vw = math.radians(8.0)
             if angle_diff < 0:
                 vw = -vw
             return 0.0, 0.0, vw

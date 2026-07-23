@@ -303,14 +303,14 @@ class MainWindow(QMainWindow):
     def _on_java_nav_trigger(self):
         """Java MQTT触发导航 → (1300, -175) @ 90°"""
         print("[JAVA_NAV] 触发导航 -> (1300, -270) @ 90°")
-        self.target_x.setText("1320")
+        self.target_x.setText("1335")
         self.target_y.setText("-290")
-        self.target_theta_deg.setText("95")
+        self.target_theta_deg.setText("91")
         self._is_java_nav = True
         self._java_nav_active = True  # 标记 JAVA_NAV 导航，完成后抑制雷达直到 OpenMV 0xA2
         self._suppress_lidar = False  # 恢复雷达点云接收与绘制
-        self.navigator.final_approach_dist = 100.0
-        self.navigator.safety_boost = 10.0  # 碰撞框额外扩大60mm
+        self.navigator.final_approach_dist = 10.0
+        self.navigator.safety_boost = 3.0  # 碰撞框额外扩大60mm
         if self.ws_server:
             self.ws_server.send_text("2")
         self.start_navigation()
@@ -318,13 +318,13 @@ class MainWindow(QMainWindow):
     def _on_nav_zero_trigger(self):
         """MQTT "0" 触发导航 → (350, -1450) @ -90°"""
         print("[NAV_ZERO] 触发导航 -> (320, -1395) @ -90°")
-        self.target_x.setText("330")
+        self.target_x.setText("320")
         self.target_y.setText("-1310")
         self.target_theta_deg.setText("-90")
         self._is_java_nav = True
         self._nav_zero_active = True   # 标记 NAV_ZERO 导航，完成后抑制雷达直到 WS_CMD_6
         self._suppress_lidar = False  # 恢复雷达点云接收与绘制
-        self.navigator.final_approach_dist = 100.0
+        self.navigator.final_approach_dist = 70.0
         self.navigator.safety_boost = 3.0  # 碰撞框额外扩大60mm
         if self.ws_server:
             self.ws_server.send_text("1")
@@ -333,8 +333,8 @@ class MainWindow(QMainWindow):
     def _on_ws_cmd_5(self):
         """前端 WebSocket 发送 "5" → 触发导航（帧数>30后由前端确认启动）"""
         print("[WS_CMD_5] 前端触发 → 导航至 (420, -90) @ 0°")
-        self.target_x.setText("420")
-        self.target_y.setText("-90")
+        self.target_x.setText("380")
+        self.target_y.setText("-70")
         self.target_theta_deg.setText("-5")
         self.navigator._nav_count = 0  # 确保作为首次导航，走起点保护流程
         self._ws_cmd_5_active = True
@@ -700,6 +700,9 @@ class MainWindow(QMainWindow):
                 if self._ws_cmd_5_active and self.navigator.state == "DONE":
                     self._suppress_lidar = True
                     self._ws_cmd_5_active = False
+                    # 推送 "a" 给前端，通知已到达 (420, -90) 点位
+                    if self.ws_server:
+                        self.ws_server.send_text("a")
                     with self.mapper.lock:
                         self.mapper.latest_points_local = []
                         self.mapper.latest_points_world = []
@@ -733,6 +736,9 @@ class MainWindow(QMainWindow):
                 if self._nav_zero_active and self.navigator.state == "DONE":
                     self._suppress_lidar = True
                     self._nav_zero_active = False
+                    # 推送 "b" 给前端，通知已到达 NAV_ZERO 点位
+                    if self.ws_server:
+                        self.ws_server.send_text("b")
                     with self.mapper.lock:
                         self.mapper.latest_points_local = []
                         self.mapper.latest_points_world = []
@@ -742,6 +748,9 @@ class MainWindow(QMainWindow):
                 if self._ws_cmd_6_active and self.navigator.state == "DONE":
                     self._suppress_lidar = True
                     self._ws_cmd_6_active = False
+                    # 推送 "c" 给前端，通知已到达 WS_CMD_6 点位
+                    if self.ws_server:
+                        self.ws_server.send_text("c")
                     with self.mapper.lock:
                         self.mapper.latest_points_local = []
                         self.mapper.latest_points_world = []
@@ -751,6 +760,9 @@ class MainWindow(QMainWindow):
                 if self._java_nav_active and self.navigator.state == "DONE":
                     self._suppress_lidar = True
                     self._java_nav_active = False
+                    # 推送 "d" 给前端，通知已到达 JAVA_NAV 点位
+                    if self.ws_server:
+                        self.ws_server.send_text("d")
                     with self.mapper.lock:
                         self.mapper.latest_points_local = []
                         self.mapper.latest_points_world = []
