@@ -74,62 +74,24 @@ class LidarMapper:
         self.last_w = 0.0
         self.last_odom_time = time.time()
 
-        # 闭环检测
-        self.loop_closure_enabled = True
-        self.loop_threshold_mm = 300
-        self.loop_theta_threshold = 15
-        self.start_pose = (0.0, 0.0, 0.0)
-        self.is_first_odom = True
-        self.loop_detected = False
-        self.loop_correction = (0.0, 0.0, 0.0)
 
     def update_odom_direct(self, odom: OdomData, timestamp_ms: int):
         if not odom.valid:
             return
 
         with self.lock:
-            if self.is_first_odom:
-                self.start_pose = (odom.x, odom.y, odom.theta)
-                self.is_first_odom = False
-
-            corrected_x = odom.x + self.loop_correction[0]
-            corrected_y = odom.y + self.loop_correction[1]
-            corrected_theta = odom.theta + self.loop_correction[2]
-
-            if self.loop_closure_enabled and not self.loop_detected:
-                dx = corrected_x - self.start_pose[0]
-                dy = corrected_y - self.start_pose[1]
-                dist_to_start = math.hypot(dx, dy)
-                dtheta = abs(math.degrees(corrected_theta - self.start_pose[2]))
-
-                if dist_to_start < self.loop_threshold_mm and dtheta < self.loop_theta_threshold:
-                    if self.frame_count > 100:
-                        print(f"[LOOP] 闭环检测！距离起点 {dist_to_start:.0f}mm, 角度差 {dtheta:.1f}°")
-                        self.loop_correction = (
-                            self.start_pose[0] - odom.x,
-                            self.start_pose[1] - odom.y,
-                            self._normalize_angle(self.start_pose[2] - odom.theta)
-                        )
-                        self.loop_detected = True
-                        print(f"[LOOP] 应用修正: dx={self.loop_correction[0]:.1f}, "
-                              f"dy={self.loop_correction[1]:.1f}, "
-                              f"dθ={math.degrees(self.loop_correction[2]):.1f}°")
-                        corrected_x = self.start_pose[0]
-                        corrected_y = self.start_pose[1]
-                        corrected_theta = self.start_pose[2]
-
             self.last_v = math.hypot(odom.vx, odom.vy)
             self.last_w = odom.wz
-            self.pose.set_pose(corrected_x, corrected_y, corrected_theta)
+            self.pose.set_pose(odom.x, odom.y, odom.theta)
 
             if len(self.trajectory) > 0:
                 last_x, last_y = self.trajectory[-1]
-                dist = math.hypot(corrected_x - last_x, corrected_y - last_y)
+                dist = math.hypot(odom.x - last_x, odom.y - last_y)
             else:
                 dist = float('inf')
 
             if dist > 15:
-                self.trajectory.append((corrected_x, corrected_y))
+                self.trajectory.append((odom.x, odom.y))
 
             self.last_odom_time = time.time()
 
@@ -163,8 +125,7 @@ class LidarMapper:
                 'total_points': self.total_points,
                 'pose': (self.pose.x, self.pose.y, self.pose.theta),
                 'map_size': self.map.size,
-                'history_points': len(self.all_scanned_points),
-                'loop_detected': self.loop_detected
+                'history_points': len(self.all_scanned_points)
             }
 
     def get_odom_stats(self):
@@ -176,8 +137,7 @@ class LidarMapper:
                 'trajectory_len': len(self.trajectory),
                 'last_v': self.last_v,
                 'last_w': self.last_w,
-                'last_update': time.time() - self.last_odom_time,
-                'loop_correction': self.loop_correction
+                'last_update': time.time() - self.last_odom_time
             }
 
     def save_map(self, filepath: str):
@@ -202,9 +162,6 @@ class LidarMapper:
             self.last_odom_time = time.time()
             self.last_v = 0.0
             self.last_w = 0.0
-            self.is_first_odom = True
-            self.loop_detected = False
-            self.loop_correction = (0.0, 0.0, 0.0)
 
     def reset_odometry(self):
         with self.lock:
@@ -214,9 +171,6 @@ class LidarMapper:
             self.last_odom_time = time.time()
             self.last_v = 0.0
             self.last_w = 0.0
-            self.is_first_odom = True
-            self.loop_detected = False
-            self.loop_correction = (0.0, 0.0, 0.0)
 
     def filter_points(self, points: list) -> list:
         """严格过滤：只保留可靠边界点，从源头减少黑点"""

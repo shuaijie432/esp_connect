@@ -520,12 +520,11 @@ class MapWidget(QWidget):
         painter.setPen(QColor(220, 220, 220))
         font = QFont("Microsoft YaHei", 10)
         painter.setFont(font)
-        loop_status = "✓闭环" if stats.get('loop_detected', False) else "✗未闭环"
-        info = (f"帧数: {stats['frame_count']} " 
-                f"当前帧点数: {len(local_pts)} " 
+        info = (f"帧数: {stats['frame_count']} "
+                f"当前帧点数: {len(local_pts)} "
                 f"历史点数: {stats['history_points']}"
-                f"机器人: ({stats['pose'][0]:.0f}, {stats['pose'][1]:.0f})mm " 
-                f"朝向: {math.degrees(theta):.1f}° [{loop_status}]")
+                f"机器人: ({stats['pose'][0]:.0f}, {stats['pose'][1]:.0f})mm "
+                f"朝向: {math.degrees(theta):.1f}°")
         painter.drawText(10, 25, info)
         if self.navigator:
             nav_status = self.navigator.get_status()

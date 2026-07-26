@@ -142,14 +142,12 @@ class WebSocketServer:
             "stats": {
                 "frame_count": stats["frame_count"], "total_points": stats["total_points"],
                 "history_points": stats["history_points"], "map_size": stats["map_size"],
-                "loop_detected": stats["loop_detected"],
             },
             "odom": {
                 "x": odom["x"], "y": odom["y"], "theta": odom["theta"],
                 "trajectory_len": odom["trajectory_len"],
                 "last_v": odom["last_v"], "last_w": odom["last_w"],
                 "last_update": odom["last_update"],
-                "loop_correction": list(odom["loop_correction"]),
             },
             "map_grid": map_grid, "map_size_mm": map_size_mm, "map_resolution": resolution,
             "scan_points": scan_points, "trajectory": traj, "nav_path": nav_path,
@@ -258,12 +256,27 @@ class WebSocketServer:
         elif action == "clear_map":
             if self._on_clear_map:
                 self._on_clear_map()
-        elif action == "5":
-            if self._on_cmd_5:
-                self._on_cmd_5()
-        elif action == "6":
-            if self._on_cmd_6:
-                self._on_cmd_6()
+        else:
+            # 关键词匹配：前端发 "去苹果那里" → 匹配到 "苹果" → 导航至苹果采摘区
+            matched = self._match_action_keyword(action)
+            if matched and self._on_pick_action:
+                self._on_pick_action(matched)
+
+    # ---- 关键词匹配 ----
+    _action_keywords: list[str] = []
+
+    def set_action_keywords(self, keywords: list[str]):
+        """设置前端 action 的关键词列表（从 nav_targets.json 的 keys 加载）"""
+        # 按长度降序排列，优先匹配长的关键词（如 "好果存放区" 优先于 "苹果"）
+        self._action_keywords = sorted(keywords, key=len, reverse=True)
+
+    def _match_action_keyword(self, action: str) -> str | None:
+        """关键词子串匹配：遍历关键词列表，返回第一个匹配到的关键词"""
+        for kw in self._action_keywords:
+            if kw in action:
+                print(f"[WS] 关键词匹配: '{action}' → '{kw}'")
+                return kw
+        return None
 
     # ---- 回调 ----
     _on_set_target = None
@@ -271,8 +284,7 @@ class WebSocketServer:
     _on_stop_nav = None
     _on_clear_map = None
     _on_map_click = None
-    _on_cmd_5 = None
-    _on_cmd_6 = None
+    _on_pick_action = None
 
     def on_set_target(self, callback):
         self._on_set_target = callback
@@ -289,11 +301,9 @@ class WebSocketServer:
     def on_map_click(self, callback):
         self._on_map_click = callback
 
-    def on_cmd_5(self, callback):
-        self._on_cmd_5 = callback
-
-    def on_cmd_6(self, callback):
-        self._on_cmd_6 = callback
+    def on_pick_action(self, callback):
+        """callback(fruit_name: str) — 前端发送采摘命令（苹果/橙子/桃子）"""
+        self._on_pick_action = callback
 
     # ==================== 启停 ====================
 

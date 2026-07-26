@@ -57,8 +57,7 @@ class Communicate(QObject):
     ws_start_nav = pyqtSignal()                     # 前端: 开始导航
     ws_stop_nav = pyqtSignal()                      # 前端: 停止导航
     ws_clear_map = pyqtSignal()                     # 前端: 清空地图
-    ws_cmd_5 = pyqtSignal()                        # 前端: 发送 "5"
-    ws_cmd_6 = pyqtSignal()                        # 前端: 发送 "6"
+    pick_action = pyqtSignal(str)                    # 前端: 采摘命令（苹果/橙子/桃子）
 
 
 class MainWindow(QMainWindow):
@@ -111,9 +110,6 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("color: orange; font-size: 16px; font-weight: bold;")
         right_layout.addWidget(self.status_label)
 
-        self.loop_label = QLabel("闭环: 未检测")
-        self.loop_label.setStyleSheet("font-size: 14px; color: #ff6666; font-weight: bold;")
-        right_layout.addWidget(self.loop_label)
 
         self.stats_label = QLabel("帧数: 0\n点数: 0")
         self.stats_label.setStyleSheet("font-size: 13px; line-height: 1.5;")
@@ -123,9 +119,6 @@ class MainWindow(QMainWindow):
         self.odom_label.setStyleSheet("font-size: 13px; line-height: 1.5; color: #66ccff;")
         right_layout.addWidget(self.odom_label)
 
-        self.corr_label = QLabel("修正量: dx=0, dy=0, dθ=0°")
-        self.corr_label.setStyleSheet("font-size: 12px; line-height: 1.5; color: #ffcc66;")
-        right_layout.addWidget(self.corr_label)
 
         self.vel_label = QLabel("速度: v=0 mm/s, w=0 rad/s")
         self.vel_label.setStyleSheet("font-size: 13px; line-height: 1.5; color: #ffcc66;")
@@ -254,8 +247,7 @@ class MainWindow(QMainWindow):
         self.comm.ws_start_nav.connect(self.start_navigation)
         self.comm.ws_stop_nav.connect(self.stop_navigation)
         self.comm.ws_clear_map.connect(self.clear_map)
-        self.comm.ws_cmd_5.connect(self._on_ws_cmd_5)
-        self.comm.ws_cmd_6.connect(self._on_ws_cmd_6)
+        self.comm.pick_action.connect(self._on_pick_action)
 
         self.nav_timer = QTimer()
         self.nav_timer.timeout.connect(self.nav_step)
@@ -286,14 +278,17 @@ class MainWindow(QMainWindow):
         self._is_openmv_nav = False   # OpenMV 0xA2 触发的导航，完成后发 "1" 给 OpenMV
         self._openmv_a2_count = 0     # 0xA2 接收计数：第1次→(1170,-1520)，第2次→(25,30)
         self._suppress_lidar = False  # WS_CMD_5完成后→NAV_ZERO完成前 以及 NAV_ZERO完成后→WS_CMD_6前，抑制雷达点云
-        self._ws_cmd_5_active = False # 标记 WS_CMD_5 导航正在进行中
-        self._nav_zero_active = False # 标记 NAV_ZERO 导航进行中，完成后抑制雷达直到 WS_CMD_6
-        self._ws_cmd_6_active = False # 标记 WS_CMD_6 导航进行中，完成后抑制雷达直到 JAVA_NAV
+        self._pick_action_active = ""  # 当前采摘导航进行中的水果名（空=无），完成后抑制雷达
+        self._nav_zero_active = False # 标记 NAV_ZERO 导航进行中，完成后抑制雷达直到采摘命令
         self._java_nav_active = False # 标记 JAVA_NAV 导航进行中，完成后抑制雷达直到 OpenMV 0xA2
 
         # ---- 点位文件顺序导航 ----
         self._waypoint_list = []       # 从JSON加载的点位列表
         self._waypoint_index = 0       # 当前点位索引
+
+        # ---- 导航目标配置（从 nav_targets.json 加载，避免硬编码坐标） ----
+        self._nav_targets_config = {}
+        self._load_nav_targets()
 
     def _on_obstacle_fusion(self, obstacle_candidates):
         self._pending_obstacles.extend(obstacle_candidates)
@@ -301,54 +296,20 @@ class MainWindow(QMainWindow):
             self._pending_obstacles = self._pending_obstacles[-2500:]
 
     def _on_java_nav_trigger(self):
-        """Java MQTT触发导航 → (1300, -175) @ 90°"""
-        print("[JAVA_NAV] 触发导航 -> (1300, -270) @ 90°")
-        self.target_x.setText("1335")
-        self.target_y.setText("-290")
-        self.target_theta_deg.setText("91")
-        self._is_java_nav = True
-        self._java_nav_active = True  # 标记 JAVA_NAV 导航，完成后抑制雷达直到 OpenMV 0xA2
-        self._suppress_lidar = False  # 恢复雷达点云接收与绘制
-        self.navigator.final_approach_dist = 10.0
-        self.navigator.safety_boost = 3.0  # 碰撞框额外扩大60mm
-        if self.ws_server:
-            self.ws_server.send_text("2")
-        self.start_navigation()
+        """MQTT "2" 触发 → 从 nav_targets.json 加载 'java_nav' 目标"""
+        print("[JAVA_NAV] MQTT '2' 触发")
+        self._apply_nav_target("java_nav")
 
     def _on_nav_zero_trigger(self):
-        """MQTT "0" 触发导航 → (350, -1450) @ -90°"""
-        print("[NAV_ZERO] 触发导航 -> (320, -1395) @ -90°")
-        self.target_x.setText("320")
-        self.target_y.setText("-1310")
-        self.target_theta_deg.setText("-90")
-        self._is_java_nav = True
-        self._nav_zero_active = True   # 标记 NAV_ZERO 导航，完成后抑制雷达直到 WS_CMD_6
-        self._suppress_lidar = False  # 恢复雷达点云接收与绘制
-        self.navigator.final_approach_dist = 70.0
-        self.navigator.safety_boost = 3.0  # 碰撞框额外扩大60mm
-        if self.ws_server:
-            self.ws_server.send_text("1")
-        self.start_navigation()
+        """MQTT "0" 触发 → 从 nav_targets.json 加载 'nav_zero' 目标"""
+        print("[NAV_ZERO] MQTT '0' 触发")
+        self._apply_nav_target("nav_zero")
 
-    def _on_ws_cmd_5(self):
-        """前端 WebSocket 发送 "5" → 触发导航（帧数>30后由前端确认启动）"""
-        print("[WS_CMD_5] 前端触发 → 导航至 (420, -90) @ 0°")
-        self.target_x.setText("380")
-        self.target_y.setText("-70")
-        self.target_theta_deg.setText("-5")
-        self.navigator._nav_count = 0  # 确保作为首次导航，走起点保护流程
-        self._ws_cmd_5_active = True
-        self.start_navigation()
-
-    def _on_ws_cmd_6(self):
-        """前端 WebSocket 发送 "6" → 导航至 (1170, -1520) @ -180°"""
-        print("[WS_CMD_6] 前端触发 → 导航至 (1170, -1520) @ -180°")
-        self.target_x.setText("1170")
-        self.target_y.setText("-1520")
-        self.target_theta_deg.setText("-180")
-        self._suppress_lidar = False  # 恢复雷达点云接收与绘制
-        self._ws_cmd_6_active = True  # 标记 WS_CMD_6 导航，完成后抑制雷达直到 JAVA_NAV
-        self.start_navigation()
+    def _on_pick_action(self, fruit_name: str):
+        """前端采摘命令（苹果/橙子/桃子）→ 从 nav_targets.json 加载对应目标"""
+        print(f"[PICK] 前端采摘命令 '{fruit_name}' 触发")
+        self._apply_nav_target(fruit_name)        # 先应用目标（内部会清除旧标记）
+        self._pick_action_active = fruit_name      # 再设置采摘标记（避免被 _clear_nav_flags 覆盖）
 
     def _on_openmv_data(self, data: bytes):
         """处理 OpenMV 发来的数据"""
@@ -368,18 +329,12 @@ class MainWindow(QMainWindow):
                         "font-size: 12px; line-height: 1.4; color: #ffcc00;"
                     )
                 else:
-                    tx, ty, tdeg = "95", "-60", "0"
-                    print(f"[OPENMV] 第{self._openmv_a2_count}次收到 0xA2 → 导航至 ({tx}, {ty}) @ {tdeg}°")
-                    self.openmv_label.setText(f"OpenMV: 0xA2 (#{self._openmv_a2_count}) → ({tx}, {ty})")
+                    print(f"[OPENMV] 第{self._openmv_a2_count}次收到 0xA2 → 导航至 openmv_a2 目标")
+                    self.openmv_label.setText(f"OpenMV: 0xA2 (#{self._openmv_a2_count})")
                     self.openmv_label.setStyleSheet(
                         "font-size: 12px; line-height: 1.4; color: #66ff66;"
                     )
-                    self.target_x.setText(tx)
-                    self.target_y.setText(ty)
-                    self.target_theta_deg.setText(tdeg)
-                    self._is_openmv_nav = True
-                    self._suppress_lidar = False  # 恢复雷达点云接收与绘制
-                    self.start_navigation()
+                    self._apply_nav_target("openmv_a2")
             elif cmd == 0x02:
                 self.openmv_label.setText(f"OpenMV: 收到指令 0x02")
                 self.openmv_label.setStyleSheet(
@@ -472,6 +427,108 @@ class MainWindow(QMainWindow):
             "green"
         )
         self._start_waypoint(0)
+
+    # ========== 导航目标配置加载 ==========
+
+    def _load_nav_targets(self):
+        """从 nav_targets.json 加载所有导航目标配置"""
+        import json
+        import os
+
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nav_targets.json")
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self._nav_targets_config = data.get("targets", {})
+            print(f"[CONFIG] 已加载 {len(self._nav_targets_config)} 个导航目标: "
+                  f"{list(self._nav_targets_config.keys())}")
+
+            # 将用户可见的关键词传给 WebSocket 服务器，用于前端 action 子串匹配
+            # 排除内部触发名（java_nav / nav_zero / openmv_a2 由 MQTT/OpenMV 触发，不通过 WebSocket）
+            _internal_names = {"java_nav", "nav_zero", "openmv_a2"}
+            _ws_keywords = [k for k in self._nav_targets_config.keys() if k not in _internal_names]
+            if self.ws_server:
+                self.ws_server.set_action_keywords(_ws_keywords)
+            print(f"[CONFIG] WebSocket 关键词: {_ws_keywords}")
+        except FileNotFoundError:
+            print(f"[CONFIG] 未找到 nav_targets.json，将使用代码中的默认值")
+            self._nav_targets_config = {}
+        except Exception as e:
+            print(f"[CONFIG] 加载 nav_targets.json 失败: {e}")
+            self._nav_targets_config = {}
+
+    def _clear_nav_flags(self):
+        """清除所有导航状态标记，防止上一次导航的遗留标记干扰新导航"""
+        self._is_java_nav = False
+        self._is_openmv_nav = False
+        self._java_nav_active = False
+        self._nav_zero_active = False
+        self._pick_action_active = ""
+
+    def _apply_nav_target(self, name: str):
+        """从配置中加载指定目标的参数并启动导航
+
+        配置文件 nav_targets.json 中每个 target 可包含:
+            - x, y, theta_deg         (必填) 目标坐标与角度
+            - final_approach_dist     (可选) 最终接近距离
+            - safety_boost            (可选) 碰撞框额外扩大
+            - is_java_nav / is_openmv_nav (可选) 导航来源标记
+            - reset_nav_count         (可选) 重置导航计数
+            - ws_send                 (可选) 发给前端的 WebSocket 消息
+            - flags                   (可选) 需要设置的标记位字典
+        """
+        target = self._nav_targets_config.get(name)
+        if not target:
+            print(f"[NAV_TARGET] 未找到目标配置 '{name}'，回退到默认值")
+            return False
+
+        # 清除上一次导航的遗留标记，避免多个完成处理器同时触发
+        self._clear_nav_flags()
+
+        desc = target.get("description", name)
+        tx = target["x"]
+        ty = target["y"]
+        tdeg = target["theta_deg"]
+
+        print(f"[NAV_TARGET] {desc} → ({tx}, {ty}) @ {tdeg}°")
+
+        # 设置目标坐标
+        self.target_x.setText(str(tx))
+        self.target_y.setText(str(ty))
+        self.target_theta_deg.setText(str(tdeg))
+
+        # 可选: 导航器参数
+        if "final_approach_dist" in target:
+            self.navigator.final_approach_dist = float(target["final_approach_dist"])
+        if "safety_boost" in target:
+            self.navigator.safety_boost = float(target["safety_boost"])
+
+        # 可选: 导航来源标记
+        if "is_java_nav" in target:
+            self._is_java_nav = bool(target["is_java_nav"])
+        if "is_openmv_nav" in target:
+            self._is_openmv_nav = bool(target["is_openmv_nav"])
+
+        # 可选: 重置导航计数（模拟首次导航走起点保护）
+        if target.get("reset_nav_count"):
+            self.navigator._nav_count = 0
+
+        # 通用 flags
+        flags = target.get("flags", {})
+        for flag_name, flag_value in flags.items():
+            attr_name = f"_{flag_name}"
+            if hasattr(self, attr_name):
+                setattr(self, attr_name, bool(flag_value))
+            else:
+                print(f"[NAV_TARGET] 警告: 未知标记 '{flag_name}'，已跳过")
+
+        # 可选: 通知前端
+        ws_msg = target.get("ws_send")
+        if ws_msg and self.ws_server:
+            self.ws_server.send_text(str(ws_msg))
+
+        self.start_navigation()
+        return True
 
     def _start_waypoint(self, index: int):
         """启动第 index 个点位的导航"""
@@ -696,17 +753,20 @@ class MainWindow(QMainWindow):
                 self.send_velocity_command(0.0, 0.0, 0.0)
                 self._nav_was_active = False
 
-                # ---- WS_CMD_5 导航完成 → 开始抑制雷达点云（直到 _on_nav_zero_trigger） ----
-                if self._ws_cmd_5_active and self.navigator.state == "DONE":
+                # ---- 采摘导航完成 → 抑制雷达点云 + 通知前端 ----
+                if self._pick_action_active and self.navigator.state == "DONE":
+                    fruit = self._pick_action_active
                     self._suppress_lidar = True
-                    self._ws_cmd_5_active = False
-                    # 推送 "a" 给前端，通知已到达 (420, -90) 点位
-                    if self.ws_server:
-                        self.ws_server.send_text("a")
+                    self._pick_action_active = ""
+                    # 从配置中读取完成消息
+                    cfg = self._nav_targets_config.get(fruit, {})
+                    complete_msg = cfg.get("pick_complete_msg", "")
+                    if complete_msg and self.ws_server:
+                        self.ws_server.send_text(complete_msg)
                     with self.mapper.lock:
                         self.mapper.latest_points_local = []
                         self.mapper.latest_points_world = []
-                    print("[LIDAR] WS_CMD_5 导航完成，开始抑制雷达点云接收与绘制")
+                    print(f"[PICK] '{fruit}' 导航完成，抑制雷达点云，推送 '{complete_msg}' 给前端")
 
                 # ---- 点位顺序导航：当前点完成 → 自动启动下一点 ----
                 if (self.navigator.state == "DONE"
@@ -743,18 +803,6 @@ class MainWindow(QMainWindow):
                         self.mapper.latest_points_local = []
                         self.mapper.latest_points_world = []
                     print("[LIDAR] NAV_ZERO 导航完成，开始抑制雷达点云接收与绘制（等待 WS_CMD_6 触发）")
-
-                # ---- WS_CMD_6 导航完成 → 抑制雷达点云，等待 JAVA_NAV ----
-                if self._ws_cmd_6_active and self.navigator.state == "DONE":
-                    self._suppress_lidar = True
-                    self._ws_cmd_6_active = False
-                    # 推送 "c" 给前端，通知已到达 WS_CMD_6 点位
-                    if self.ws_server:
-                        self.ws_server.send_text("c")
-                    with self.mapper.lock:
-                        self.mapper.latest_points_local = []
-                        self.mapper.latest_points_world = []
-                    print("[LIDAR] WS_CMD_6 导航完成，开始抑制雷达点云接收与绘制（等待 JAVA_NAV 触发）")
 
                 # ---- JAVA_NAV 导航完成 → 抑制雷达点云，等待 OpenMV 0xA2 ----
                 if self._java_nav_active and self.navigator.state == "DONE":
@@ -926,13 +974,6 @@ class MainWindow(QMainWindow):
             f"朝向: {math.degrees(stats['pose'][2]):.1f}°"
         )
 
-        if stats['loop_detected']:
-            self.loop_label.setText("闭环: ✓ 已闭合")
-            self.loop_label.setStyleSheet("font-size: 14px; color: #66ff66; font-weight: bold;")
-        else:
-            self.loop_label.setText("闭环: ✗ 未闭合")
-            self.loop_label.setStyleSheet("font-size: 14px; color: #ff6666; font-weight: bold;")
-
         # WebSocket 广播：截图推送 GUI 界面到 Vue 前端（仅好果+坏果存放区）
         if self.ws_server:
             self.ws_server.broadcast_full_state()
@@ -972,11 +1013,7 @@ class MainWindow(QMainWindow):
             f"θ: {math.degrees(odom_stats['theta']):.2f}°\n"
             f"轨迹点数: {odom_stats['trajectory_len']}"
         )
-        corr = odom_stats['loop_correction']
-        self.corr_label.setText(
-            f"修正量: dx={corr[0]:.1f}, dy={corr[1]:.1f}, "
-            f"dθ={math.degrees(corr[2]):.1f}°"
-        )
+
         self.vel_label.setText(
             f"最新速度\n"
             f"v: {odom_stats['last_v']:.1f} mm/s\n"
@@ -1045,10 +1082,8 @@ class MainWindow(QMainWindow):
         self.obstacle_label.setText("障碍物: 0个永久, 0个临时")
         self.openmv_label.setText("OpenMV: 等待数据...")
         self.openmv_label.setStyleSheet("font-size: 12px; line-height: 1.4; color: #66ff99;")
-        self.loop_label.setText("闭环: ✗ 未闭合")
-        self.loop_label.setStyleSheet("font-size: 14px; color: #ff6666; font-weight: bold;")
         self.odom_label.setText("里程计: 等待数据...")
-        self.corr_label.setText("修正量: dx=0, dy=0, dθ=0°")
+
         self.vel_label.setText("速度: v=0 mm/s, w=0 rad/s")
         self.queue_label.setText("队列: 0/3")
 
@@ -1321,8 +1356,7 @@ def main():
     ws_server.on_start_nav(lambda: comm.ws_start_nav.emit())
     ws_server.on_stop_nav(lambda: comm.ws_stop_nav.emit())
     ws_server.on_clear_map(lambda: comm.ws_clear_map.emit())
-    ws_server.on_cmd_5(lambda: comm.ws_cmd_5.emit())
-    ws_server.on_cmd_6(lambda: comm.ws_cmd_6.emit())
+    ws_server.on_pick_action(lambda fruit: comm.pick_action.emit(fruit))
     window.show()
 
     proc_thread = threading.Thread(
