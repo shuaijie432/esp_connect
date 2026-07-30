@@ -4,6 +4,7 @@
 """Main: 静态地图导航 + 速度闭环控制下发 - 最终修复版（适配机器人半径230mm）"""
 
 import sys
+import json
 import math
 import time
 import threading
@@ -18,7 +19,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSplitter, QLineEdit
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject  , QPoint, QRect
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QRect
 from PyQt5.QtGui import QFont
 
 from lidar_parser import parse_frame
@@ -28,20 +29,29 @@ from navigator import Navigator
 from laser_odometry import LaserOdometry
 from ws_server import WebSocketServer
 
+
 MQTT_HOST = "10.113.145.227"
 MQTT_PORT = 1883
 MQTT_USER = "esp_send"
 MQTT_PASS = "00000000"
 TOPIC_LIDAR = "esp/f79541/data"
 TOPIC_CONTROL = "device/f79541/data"
-TOPIC_OPENMV  = "openmv/nav"
+TOPIC_OPENMV  = "openmv/nav111"
 TOPIC_OPENMV_RECV = "openmv/data"      # 接收 OpenMV 发来的数据
+TOPIC_VOICE_TASK = "python/task/voice"  # 订阅: Java 后端 → Python 语音任务
+TOPIC_TASK_RESULT = "python/task/result"  # 发布: Python → Java 后端任务结果
 
 
 MAP_SIZE_MM = 8000
 RESOLUTION_MM = 10
 FRAME_QUEUE_SIZE = 3
 MAP_FILE = "1.png"
+
+# WebSocket 截图裁剪区域（相对于主窗口左上角，单位：像素）
+CROP_X = 600      # 从 GUI 左边缘往右多少 px 开始截
+CROP_Y = 250      # 从 GUI 上边缘往下多少 px 开始截
+CROP_W = 600    # 截图宽度
+CROP_H = 480    # 截图高度
 
 
 class Communicate(QObject):
@@ -52,12 +62,7 @@ class Communicate(QObject):
     java_nav_trigger = pyqtSignal()
     nav_zero_trigger = pyqtSignal()                # MQTT "0" 触发导航 → (400, -1450) @ -90°
     openmv_data = pyqtSignal(bytes)                # OpenMV 发来的原始帧数据
-    ws_map_click = pyqtSignal(int, int, int, int)  # 前端点击: img_x, img_y, img_w, img_h
-    ws_set_target = pyqtSignal(float, float)        # 前端: 设置目标坐标 → 导航
-    ws_start_nav = pyqtSignal()                     # 前端: 开始导航
-    ws_stop_nav = pyqtSignal()                      # 前端: 停止导航
-    ws_clear_map = pyqtSignal()                     # 前端: 清空地图
-    pick_action = pyqtSignal(str)                    # 前端: 采摘命令（苹果/橙子/桃子）
+    voice_task = pyqtSignal(dict)                    # Java 后端: 语音任务（JSON 解析后的 dict）
 
 
 class MainWindow(QMainWindow):
@@ -241,13 +246,8 @@ class MainWindow(QMainWindow):
         # 地图点击 → 设置目标并开始导航
         self.map_view.map_clicked.connect(self.on_map_clicked)
 
-        # 前端 WebSocket 操作 → 和本地按钮效果一致
-        self.comm.ws_map_click.connect(self.handle_ws_map_click)
-        self.comm.ws_set_target.connect(self.on_map_clicked)
-        self.comm.ws_start_nav.connect(self.start_navigation)
-        self.comm.ws_stop_nav.connect(self.stop_navigation)
-        self.comm.ws_clear_map.connect(self.clear_map)
-        self.comm.pick_action.connect(self._on_pick_action)
+
+        self.comm.voice_task.connect(self._on_voice_task)
 
         self.nav_timer = QTimer()
         self.nav_timer.timeout.connect(self.nav_step)
@@ -277,10 +277,12 @@ class MainWindow(QMainWindow):
         self._is_java_nav = False      # MQTT "2" 触发的导航，对齐完成后不发 OpenMV
         self._is_openmv_nav = False   # OpenMV 0xA2 触发的导航，完成后发 "1" 给 OpenMV
         self._openmv_a2_count = 0     # 0xA2 接收计数：第1次→(1170,-1520)，第2次→(25,30)
-        self._suppress_lidar = False  # WS_CMD_5完成后→NAV_ZERO完成前 以及 NAV_ZERO完成后→WS_CMD_6前，抑制雷达点云
-        self._pick_action_active = ""  # 当前采摘导航进行中的水果名（空=无），完成后抑制雷达
-        self._nav_zero_active = False # 标记 NAV_ZERO 导航进行中，完成后抑制雷达直到采摘命令
+        self._suppress_lidar = False  # NAV_ZERO/JAVA_NAV 完成时抑制雷达点云
+        self._current_voice_task = None  # 当前正在执行的 Java 后端语音任务（dict），完成后回传结果
+        self._nav_zero_active = False # 标记 NAV_ZERO 导航进行中，完成后抑制雷达
         self._java_nav_active = False # 标记 JAVA_NAV 导航进行中，完成后抑制雷达直到 OpenMV 0xA2
+        self._is_pick_nav = False    # 标记采摘水果导航，完成后向 OpenMV 发 pick_complete_msg
+        self._pick_complete_msg = "1"  # 采摘导航完成时发给 OpenMV 的字符串，默认 "1"
 
         # ---- 点位文件顺序导航 ----
         self._waypoint_list = []       # 从JSON加载的点位列表
@@ -305,11 +307,128 @@ class MainWindow(QMainWindow):
         print("[NAV_ZERO] MQTT '0' 触发")
         self._apply_nav_target("nav_zero")
 
-    def _on_pick_action(self, fruit_name: str):
-        """前端采摘命令（苹果/橙子/桃子）→ 从 nav_targets.json 加载对应目标"""
-        print(f"[PICK] 前端采摘命令 '{fruit_name}' 触发")
-        self._apply_nav_target(fruit_name)        # 先应用目标（内部会清除旧标记）
-        self._pick_action_active = fruit_name      # 再设置采摘标记（避免被 _clear_nav_flags 覆盖）
+    # ========== Java 后端语音任务处理 ==========
+
+    def _on_voice_task(self, task: dict):
+        """接收 Java 后端发来的语音任务，按 intentType 分发处理"""
+        import time as _time
+
+        intent = task.get("intentType", "")
+        task_id = task.get("taskId", "?")
+        params = task.get("parameters", {})
+
+        print(f"[VOICE_TASK] 分发任务: intentType={intent}, taskId={task_id}, params={params}")
+
+        if intent in ("PICK_FRUIT", "INSPECT_FRUIT"):
+            self._handle_pick_fruit(task)
+        elif intent == "NAVIGATE":
+            self._handle_navigate(task)
+        elif intent == "CANCEL":
+            self._handle_cancel(task)
+        else:
+            print(f"[VOICE_TASK] 不支持的 intentType: {intent}")
+            self._publish_task_result(task_id, "FAILED",
+                                      error=f"不支持的意图类型: {intent}")
+
+    def _handle_pick_fruit(self, task: dict):
+        """采摘/检查水果: 用 fruitName 匹配 nav_targets.json 中的目标"""
+        params = task.get("parameters", {})
+        fruit_name = params.get("fruitName", "")
+        task_id = task.get("taskId", "?")
+
+        if not fruit_name:
+            print(f"[VOICE_TASK] PICK_FRUIT 缺少 fruitName 参数")
+            self._publish_task_result(task_id, "FAILED", error="缺少 fruitName 参数")
+            return
+
+        # 检查 nav_targets.json 中是否存在该水果的目标
+        if fruit_name not in self._nav_targets_config:
+            print(f"[VOICE_TASK] 未找到目标配置: '{fruit_name}'")
+            self._publish_task_result(task_id, "FAILED",
+                                      error=f"未找到目标: {fruit_name}")
+            return
+
+        print(f"[VOICE_TASK] PICK_FRUIT → '{fruit_name}'")
+        self._current_voice_task = task
+        self._apply_nav_target(fruit_name)
+        self._is_pick_nav = True  # 放在 _apply_nav_target 之后，避免被 _clear_nav_flags 清掉
+
+    def _handle_navigate(self, task: dict):
+        """导航到指定点位: 用 command 关键词匹配 nav_targets.json，或用 target 精确匹配"""
+        params = task.get("parameters", {})
+        task_id = task.get("taskId", "?")
+
+        # 优先用 command 字段做关键词匹配
+        command = params.get("command", "")
+        target_name = params.get("target", "")
+
+        matched = None
+
+        if command:
+            # 关键词子串匹配 nav_targets.json 的 key（按长度降序，长关键词优先）
+            sorted_keys = sorted(self._nav_targets_config.keys(), key=len, reverse=True)
+            for key in sorted_keys:
+                if key in command:
+                    matched = key
+                    print(f"[VOICE_TASK] 关键词匹配: '{command}' → '{key}'")
+                    break
+
+        if not matched and target_name:
+            matched = target_name
+
+        if not matched:
+            print(f"[VOICE_TASK] NAVIGATE 无法匹配目标: command='{command}', target='{target_name}'")
+            self._publish_task_result(task_id, "FAILED",
+                                      error="无法从指令中识别导航目标")
+            return
+
+        if matched not in self._nav_targets_config:
+            print(f"[VOICE_TASK] 未找到目标配置: '{matched}'")
+            self._publish_task_result(task_id, "FAILED",
+                                      error=f"未找到目标: {matched}")
+            return
+
+        print(f"[VOICE_TASK] NAVIGATE → '{matched}'")
+        self._current_voice_task = task
+        self._apply_nav_target(matched)
+
+    def _handle_cancel(self, task: dict):
+        """取消当前导航任务"""
+        task_id = task.get("taskId", "?")
+        print(f"[VOICE_TASK] CANCEL → 取消当前导航")
+
+        self._current_voice_task = None
+        self.stop_navigation()
+        self._publish_task_result(task_id, "COMPLETED",
+                                  data={"action": "cancel"})
+
+    def _publish_task_result(self, task_id: str, status: str,
+                              data: dict = None, error: str = None):
+        """向 Java 后端发布任务执行结果 (topic: python/task/result)"""
+        import time as _time
+
+        if self.client is None or not self.client.is_connected():
+            print(f"[VOICE_TASK] MQTT 未连接，无法发布结果 (taskId={task_id})")
+            return
+
+        result = {
+            "taskId": task_id,
+            "status": status,
+            "timestamp": int(_time.time() * 1000),
+        }
+        if data is not None:
+            result["data"] = data
+        if error is not None:
+            result["error"] = error
+
+        try:
+            payload = json.dumps(result, ensure_ascii=False)
+            self.client.publish(TOPIC_TASK_RESULT, payload, qos=1)
+            print(f"[VOICE_TASK] 结果已发布 → {TOPIC_TASK_RESULT}: {payload}")
+        except Exception as e:
+            print(f"[VOICE_TASK] 发布结果失败: {e}")
+
+    # ========== OpenMV 数据处理 ==========
 
     def _on_openmv_data(self, data: bytes):
         """处理 OpenMV 发来的数据"""
@@ -364,34 +483,6 @@ class MainWindow(QMainWindow):
         )
         self.start_navigation()
 
-    def handle_ws_map_click(self, img_x: int, img_y: int, img_w: int, img_h: int):
-        """前端点击截图 → 像素坐标转为世界坐标 → 触发导航（在主线程执行）"""
-        map_view = self.map_view
-
-        # 1. 图片坐标 → 窗口坐标（处理可能的缩放）
-        scale_x = self.width() / img_w if img_w > 0 else 1.0
-        scale_y = self.height() / img_h if img_h > 0 else 1.0
-        win_x = int(img_x * scale_x)
-        win_y = int(img_y * scale_y)
-
-        # 2. MapWidget 在窗口中的区域
-        map_pos = map_view.mapTo(self, QPoint(0, 0))
-        map_w = map_view.width()
-        map_h = map_view.height()
-
-        # 3. 只在点击地图区域时触发
-        if not (map_pos.x() <= win_x <= map_pos.x() + map_w and
-                map_pos.y() <= win_y <= map_pos.y() + map_h):
-            return
-
-        # 4. 窗口坐标 → MapWidget 内坐标 → 世界坐标
-        mx = win_x - map_pos.x()
-        my = win_y - map_pos.y()
-        wx, wy = map_view.screen_to_world(mx, my, map_w, map_h)
-
-        print(f"[WS] 前端地图点击: 图片({img_x},{img_y}) → 世界({wx:.0f},{wy:.0f})mm")
-        self.on_map_clicked(wx, wy)
-
     # ============================================================
     # 点位文件加载 & 顺序导航
     # ============================================================
@@ -442,14 +533,6 @@ class MainWindow(QMainWindow):
             self._nav_targets_config = data.get("targets", {})
             print(f"[CONFIG] 已加载 {len(self._nav_targets_config)} 个导航目标: "
                   f"{list(self._nav_targets_config.keys())}")
-
-            # 将用户可见的关键词传给 WebSocket 服务器，用于前端 action 子串匹配
-            # 排除内部触发名（java_nav / nav_zero / openmv_a2 由 MQTT/OpenMV 触发，不通过 WebSocket）
-            _internal_names = {"java_nav", "nav_zero", "openmv_a2"}
-            _ws_keywords = [k for k in self._nav_targets_config.keys() if k not in _internal_names]
-            if self.ws_server:
-                self.ws_server.set_action_keywords(_ws_keywords)
-            print(f"[CONFIG] WebSocket 关键词: {_ws_keywords}")
         except FileNotFoundError:
             print(f"[CONFIG] 未找到 nav_targets.json，将使用代码中的默认值")
             self._nav_targets_config = {}
@@ -463,7 +546,8 @@ class MainWindow(QMainWindow):
         self._is_openmv_nav = False
         self._java_nav_active = False
         self._nav_zero_active = False
-        self._pick_action_active = ""
+        self._is_pick_nav = False
+        self._pick_complete_msg = "1"
 
     def _apply_nav_target(self, name: str):
         """从配置中加载指定目标的参数并启动导航
@@ -474,7 +558,6 @@ class MainWindow(QMainWindow):
             - safety_boost            (可选) 碰撞框额外扩大
             - is_java_nav / is_openmv_nav (可选) 导航来源标记
             - reset_nav_count         (可选) 重置导航计数
-            - ws_send                 (可选) 发给前端的 WebSocket 消息
             - flags                   (可选) 需要设置的标记位字典
         """
         target = self._nav_targets_config.get(name)
@@ -522,10 +605,10 @@ class MainWindow(QMainWindow):
             else:
                 print(f"[NAV_TARGET] 警告: 未知标记 '{flag_name}'，已跳过")
 
-        # 可选: 通知前端
-        ws_msg = target.get("ws_send")
-        if ws_msg and self.ws_server:
-            self.ws_server.send_text(str(ws_msg))
+        # 可选: 采摘完成时发给 OpenMV 的字符串（默认 "1"）
+        if "pick_complete_msg" in target:
+            self._pick_complete_msg = str(target["pick_complete_msg"])
+            print(f"[NAV_TARGET] pick_complete_msg = '{self._pick_complete_msg}'")
 
         self.start_navigation()
         return True
@@ -598,13 +681,8 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
 
     def start_navigation(self):
-        # ===== 可选：检查地图是否有足够障碍物信息 =====
-        # 注释掉，用户可按需取消注释
-        # occ_count = np.count_nonzero(self.mapper.map.log_odds > self.mapper.map.occ_thresh)
-        # if occ_count < 100:
-        #     self.set_status("地图障碍物信息不足，请等待激光雷达扫描一圈后再试", "orange")
-        #     return
-        # ==============================================
+        # 开始新导航时，重新开启雷达数据接收
+        self._suppress_lidar = False
 
         try:
             tx = float(self.target_x.text())
@@ -647,8 +725,9 @@ class MainWindow(QMainWindow):
         def _send_openmv():
             if self.client is not None and self.client.is_connected():
                 try:
-                    self.client.publish(TOPIC_OPENMV, "1", qos=1)
-                    print(f"[CMD] 角度对准标志位已发送(OpenMV) -> {TOPIC_OPENMV}")
+                    msg = self._pick_complete_msg
+                    self.client.publish(TOPIC_OPENMV, msg, qos=1)
+                    print(f"[CMD] 角度对准标志位已发送(OpenMV) -> {TOPIC_OPENMV} = '{msg}'")
                 except Exception as e:
                     print(f"[CMD] OpenMV发送失败: {e}")
 
@@ -657,13 +736,14 @@ class MainWindow(QMainWindow):
         self._alignment_ack_done = True
 
     def _send_openmv_signal(self):
-        """点1到达后，发字符串 \"1\" 给 OpenMV"""
+        """点1到达后，发 pick_complete_msg 给 OpenMV"""
         if self.client is None or not self.client.is_connected():
             print("[WP] MQTT未连接，无法发送OpenMV信号")
             return
         try:
-            self.client.publish(TOPIC_OPENMV, "1", qos=1)
-            print(f"[WP] 点1到达 → OpenMV信号已发送 -> {TOPIC_OPENMV}")
+            msg = self._pick_complete_msg
+            self.client.publish(TOPIC_OPENMV, msg, qos=1)
+            print(f"[WP] 点1到达 → OpenMV信号已发送 -> {TOPIC_OPENMV} = '{msg}'")
         except Exception as e:
             print(f"[WP] OpenMV信号发送失败: {e}")
 
@@ -753,28 +833,40 @@ class MainWindow(QMainWindow):
                 self.send_velocity_command(0.0, 0.0, 0.0)
                 self._nav_was_active = False
 
-                # ---- 采摘导航完成 → 抑制雷达点云 + 通知前端 ----
-                if self._pick_action_active and self.navigator.state == "DONE":
-                    fruit = self._pick_action_active
+                # ---- 导航到达目标点 → 屏蔽雷达数据，下次启动导航时通过 flags 重新开启 ----
+                if self.navigator.state == "DONE":
                     self._suppress_lidar = True
-                    self._pick_action_active = ""
-                    # 从配置中读取完成消息
-                    cfg = self._nav_targets_config.get(fruit, {})
-                    complete_msg = cfg.get("pick_complete_msg", "")
-                    if complete_msg and self.ws_server:
-                        self.ws_server.send_text(complete_msg)
                     with self.mapper.lock:
                         self.mapper.latest_points_local = []
                         self.mapper.latest_points_world = []
-                    print(f"[PICK] '{fruit}' 导航完成，抑制雷达点云，推送 '{complete_msg}' 给前端")
+                    print(f"[LIDAR] 导航到达目标点，屏蔽雷达数据")
+
+                # ---- 语音任务导航完成 → 向 Java 后端发布结果 ----
+                if self._current_voice_task and self.navigator.state == "DONE":
+                    task = self._current_voice_task
+                    self._current_voice_task = None
+                    self._is_pick_nav = False
+                    task_id = task.get("taskId", "?")
+                    intent = task.get("intentType", "")
+                    params = task.get("parameters", {})
+                    fruit_name = params.get("fruitName", params.get("target", ""))
+
+                    # 构造返回数据
+                    result_data = {
+                        "action": "pick" if intent == "PICK_FRUIT" else "navigate",
+                        "fruit": fruit_name,
+                        "position": 2,       # TODO: 硬件反馈的实际位置
+                        "errorX": 15,          # TODO: 硬件反馈的实际误差
+                    }
+                    self._publish_task_result(task_id, "COMPLETED", data=result_data)
 
                 # ---- 点位顺序导航：当前点完成 → 自动启动下一点 ----
                 if (self.navigator.state == "DONE"
                         and self._waypoint_list
                         and self._waypoint_index + 1 < len(self._waypoint_list)):
 
-                    # 点1 完成 → 发 "1" 给 OpenMV
-                    if self._waypoint_index == 0:
+                    # 点1 完成 → 仅采摘导航时发 "1" 给 OpenMV
+                    if self._waypoint_index == 0 and self._is_pick_nav:
                         self._send_openmv_signal()
 
                     self._waypoint_index += 1
@@ -792,34 +884,26 @@ class MainWindow(QMainWindow):
                     self.send_last_waypoint_frame()
                     self._is_java_nav = False
 
-                # ---- MQTT "0" (NAV_ZERO) 导航完成 → 抑制雷达点云，等待 WS_CMD_6 ----
+                # ---- MQTT "0" (NAV_ZERO) 导航完成 → 抑制雷达点云 ----
                 if self._nav_zero_active and self.navigator.state == "DONE":
                     self._suppress_lidar = True
                     self._nav_zero_active = False
-                    # 推送 "b" 给前端，通知已到达 NAV_ZERO 点位
-                    if self.ws_server:
-                        self.ws_server.send_text("b")
                     with self.mapper.lock:
                         self.mapper.latest_points_local = []
                         self.mapper.latest_points_world = []
-                    print("[LIDAR] NAV_ZERO 导航完成，开始抑制雷达点云接收与绘制（等待 WS_CMD_6 触发）")
+                    print("[LIDAR] NAV_ZERO 导航完成，开始抑制雷达点云接收与绘制")
 
                 # ---- JAVA_NAV 导航完成 → 抑制雷达点云，等待 OpenMV 0xA2 ----
                 if self._java_nav_active and self.navigator.state == "DONE":
                     self._suppress_lidar = True
                     self._java_nav_active = False
-                    # 推送 "d" 给前端，通知已到达 JAVA_NAV 点位
-                    if self.ws_server:
-                        self.ws_server.send_text("d")
                     with self.mapper.lock:
                         self.mapper.latest_points_local = []
                         self.mapper.latest_points_world = []
                     print("[LIDAR] JAVA_NAV 导航完成，开始抑制雷达点云接收与绘制（等待 OpenMV 0xA2 触发）")
 
-                # ---- OpenMV 0xA2 导航完成 → 发 "0" 给 WebSocket ----
+                # ---- OpenMV 0xA2 导航完成 ----
                 elif self.navigator.state == "DONE" and self._is_openmv_nav:
-                    if self.ws_server:
-                        self.ws_server.send_text("0")
                     self._is_openmv_nav = False
             return
 
@@ -875,24 +959,12 @@ class MainWindow(QMainWindow):
         curr = self.navigator.current_wp
 
         if send_ack:
-            # 点位导航模式：不在对齐完成时发信号，统一由下方 DONE 检测逻辑处理
-            # （避免 send_alignment_ack_frame 向 OpenMV 误发 "1"）
-            if self._waypoint_list:
-                # 有点位列表：跳过 send_alignment_ack_frame，信号由 DONE 分支统一发送
-                print(f"[NAV] 点位角度对准完成 (idx={self._waypoint_index})，"
-                      f"最终角度: {math.degrees(theta):.1f}°，信号由DONE逻辑处理")
-            elif self._is_java_nav:
-                # MQTT "2" 触发的导航：不发 OpenMV，直接标记完成
-                print(f"[NAV] Java导航角度对准完成，最终角度: {math.degrees(theta):.1f}°"
-                      f"（跳过OpenMV发送）")
-            elif self._is_openmv_nav:
-                # OpenMV 0xA2 触发的导航：跳过对齐时发信号，由 DONE 分支统一发 "1"
-                print(f"[NAV] OpenMV导航角度对准完成，最终角度: {math.degrees(theta):.1f}°"
-                      f"（信号由DONE逻辑处理）")
-            else:
-                # 手动导航模式（地图点击等）：正常发送对齐完成帧
+            # 只有采摘水果导航才向 OpenMV 发 "1"
+            if self._is_pick_nav:
                 self.send_alignment_ack_frame()
-                print(f"[NAV] 角度对准完成！最终角度: {math.degrees(theta):.1f}°")
+                print(f"[NAV] 采摘导航角度对准完成，已向OpenMV发'1'，最终角度: {math.degrees(theta):.1f}°")
+            else:
+                print(f"[NAV] 非采摘导航角度对准完成，跳过OpenMV信号")
             self.navigator.state = "DONE"
 
         now = time.time()
@@ -974,35 +1046,10 @@ class MainWindow(QMainWindow):
             f"朝向: {math.degrees(stats['pose'][2]):.1f}°"
         )
 
-        # WebSocket 广播：截图推送 GUI 界面到 Vue 前端（仅好果+坏果存放区）
+        # WebSocket 推送 GUI 截图到前端（裁剪：从窗口左边缘 x px，上边缘 y px，宽 w px，高 h px）
         if self.ws_server:
-            self.ws_server.broadcast_full_state()
-            # 计算棕色框在主窗口上的屏幕区域
-            mv = self.map_view
-            cr = mv.crop_rect
-            cx_c, cy_c = cr.x(), cr.y()        # 中心世界坐标
-            cw_mm, ch_mm = cr.width(), cr.height()  # 宽高 mm
-            mw, mh = mv.width(), mv.height()
-            # 四个角的世界坐标 → MapWidget 屏幕坐标
-            corners = [
-                mv.world_to_screen(cx_c - cw_mm/2, cy_c - ch_mm/2, mw, mh),
-                mv.world_to_screen(cx_c + cw_mm/2, cy_c - ch_mm/2, mw, mh),
-                mv.world_to_screen(cx_c - cw_mm/2, cy_c + ch_mm/2, mw, mh),
-                mv.world_to_screen(cx_c + cw_mm/2, cy_c + ch_mm/2, mw, mh),
-            ]
-            min_sx = min(p[0] for p in corners)
-            min_sy = min(p[1] for p in corners)
-            max_sx = max(p[0] for p in corners)
-            max_sy = max(p[1] for p in corners)
-            # MapWidget 在窗口中的偏移
-            map_pos = mv.mapTo(self, QPoint(0, 0))
-            crop_rect = QRect(
-                map_pos.x() + int(min_sx),
-                map_pos.y() + int(min_sy),
-                int(max_sx - min_sx),
-                int(max_sy - min_sy),
-            )
-            self.ws_server.broadcast_window_image(quality=95, crop_rect=crop_rect)
+            crop_rect = QRect(CROP_X, CROP_Y, CROP_W, CROP_H)
+            self.ws_server.broadcast_window_image(quality=65, crop_rect=crop_rect)
 
     def update_odom_display(self):
         odom_stats = self.mapper.get_odom_stats()
@@ -1095,6 +1142,8 @@ class MainWindow(QMainWindow):
 
 
 def create_mqtt_client(frame_queue: Queue, comm: Communicate):
+    import json
+
     client_id = f"lidar_mapper_{uuid.uuid4().hex[:8]}_{int(time.time())}"
     print(f"[MQTT] Client ID: {client_id}")
 
@@ -1106,14 +1155,29 @@ def create_mqtt_client(frame_queue: Queue, comm: Communicate):
             print(f"[MQTT] 已连接到 {MQTT_HOST}:{MQTT_PORT}")
             client.subscribe(TOPIC_LIDAR, qos=0)
             client.subscribe(TOPIC_OPENMV_RECV, qos=0)
+            client.subscribe(TOPIC_VOICE_TASK, qos=1)
             print(f"[MQTT] 已订阅 {TOPIC_LIDAR}")
             print(f"[MQTT] 已订阅 {TOPIC_OPENMV_RECV} (OpenMV接收)")
+            print(f"[MQTT] 已订阅 {TOPIC_VOICE_TASK} (Java语音任务)")
             comm.status_msg.emit(f"已连接 - {MQTT_HOST}", "green")
         else:
             print(f"[MQTT] 连接失败: {rc}")
             comm.status_msg.emit(f"连接失败: {rc}", "red")
 
     def on_message(client, userdata, msg):
+        # ---- Java 后端语音任务 ----
+        if msg.topic == TOPIC_VOICE_TASK:
+            try:
+                payload_str = msg.payload.decode('utf-8') if isinstance(msg.payload, bytes) else msg.payload
+                task = json.loads(payload_str)
+                intent = task.get("intentType", "UNKNOWN")
+                task_id = task.get("taskId", "?")
+                print(f"[VOICE_TASK] 收到任务: {intent} (taskId={task_id})")
+                comm.voice_task.emit(task)
+            except Exception as e:
+                print(f"[VOICE_TASK] JSON 解析失败: {e}")
+            return
+
         # ---- 激光雷达数据 ----
         if msg.topic == TOPIC_LIDAR:
             if msg.payload == b"2":
@@ -1339,7 +1403,7 @@ def main():
     )
     comm = Communicate()
 
-    # 启动 WebSocket 服务
+    # 启动 WebSocket 服务（推送 GUI 截图到前端）
     ws_server = WebSocketServer(host="0.0.0.0", port=8765)
     ws_server.start()
 
@@ -1347,16 +1411,7 @@ def main():
     client = create_mqtt_client(frame_queue, comm)
 
     window = MainWindow(mapper, comm, client, ws_server)
-    # 绑定主窗口和 MapWidget
     ws_server.set_main_window(window)
-    ws_server.set_map_view(window.map_view)
-    # 前端操作 → 通过信号安全传递到主线程
-    ws_server.on_map_click(lambda ix, iy, iw, ih: comm.ws_map_click.emit(ix, iy, iw, ih))
-    ws_server.on_set_target(lambda x, y, theta: comm.ws_set_target.emit(x, y))
-    ws_server.on_start_nav(lambda: comm.ws_start_nav.emit())
-    ws_server.on_stop_nav(lambda: comm.ws_stop_nav.emit())
-    ws_server.on_clear_map(lambda: comm.ws_clear_map.emit())
-    ws_server.on_pick_action(lambda fruit: comm.pick_action.emit(fruit))
     window.show()
 
     proc_thread = threading.Thread(
