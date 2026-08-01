@@ -35,7 +35,7 @@ class Navigator:
 
         # ★ A* 硬膨胀 = 22格 = 220mm（覆盖对角线半长184mm + 36mm余量）
         #    确保车身蓝色方框的四个角也不会进入膨胀区
-        self.obstacle_margin = 22
+        self.obstacle_margin = 16
 
         # ★ DWA 碰撞框参数
         self.channel_margin_mm = 100.0        # 通道余量（80→100）
@@ -83,7 +83,7 @@ class Navigator:
         # 障碍物永久融合参数
         self._min_cluster_size = 1
         self._permanent_after_sec = 1.5
-        self._expire_after_sec = 10.0
+        self._expire_after_sec = 5.0
         self._obstacle_cost_gain = 120.0
         self._obstacle_cost_decay = 8.0
         self._static_cost_gain = 150.0
@@ -357,12 +357,14 @@ class Navigator:
             if current_time - obs_data['last_update'] > self._expire_after_sec:
                 expired_ids.append(obs_id)
 
+        permanent_cleared = False
         for obs_id in expired_ids:
             obs_data = self._stable_obstacles[obs_id]
             if obs_data.get('is_permanent', False):
                 for mx, my in obs_data['cells']:
                     if 0 <= mx < grid.size and 0 <= my < grid.size:
-                        grid.log_odds[my, mx] = 0.0
+                        grid.log_odds[my, mx] = grid.log_free
+                permanent_cleared = True
             del self._stable_obstacles[obs_id]
 
         MAX_TRACKED = 30
@@ -377,8 +379,13 @@ class Navigator:
                 if obs_data.get('is_permanent', False):
                     for mx, my in obs_data['cells']:
                         if 0 <= mx < grid.size and 0 <= my < grid.size:
-                            grid.log_odds[my, mx] = 0.0
+                            grid.log_odds[my, mx] = grid.log_free
+                    permanent_cleared = True
                 del self._stable_obstacles[obs_id]
+
+        if permanent_cleared and self._plan_frozen:
+            self._unfreeze_planning_map()
+            self._freeze_planning_map()
 
         matched_stable_ids = set()
 
@@ -401,7 +408,7 @@ class Navigator:
                     best_match_dist = dist
                     best_match_id = obs_id
 
-            if best_match_id is not None and best_match_dist < 500.0:
+            if best_match_id is not None and best_match_dist < 800.0:
                 obs_data = self._stable_obstacles[best_match_id]
 
                 if obs_data.get('is_permanent', False):
@@ -888,6 +895,9 @@ class Navigator:
 
         obstacle_level = self._check_obstacle_level(x, y, theta)
         front_dist = self._get_front_distance(x, y, theta)
+        left_dist = self._get_left_distance(x, y, theta)
+        right_dist = self._get_right_distance(x, y, theta)
+        rear_dist = self._get_rear_distance(x, y, theta)
 
         if front_dist < 400.0 or obstacle_level != "CLEAR":
             self.stuck_timer = now
@@ -895,12 +905,27 @@ class Navigator:
         self.state = "FOLLOWING"
         base_vx, base_vy, base_vw = self._pure_pursuit_step(x, y, theta)
 
+        # ---- 前方减速 ----
         if front_dist < 350.0:
             speed_scale = max(0.15, (front_dist - 120.0) / 230.0)
             base_vx = base_vx * speed_scale
             base_vy = base_vy * speed_scale
             if front_dist < 220.0:
                 print(f"[BRAKE] 前方障碍物 {front_dist:.0f}mm，速度缩放至 {speed_scale:.2f}")
+
+        # ---- 侧面减速 ----
+        side_min = min(left_dist, right_dist)
+        if side_min < 250.0:
+            side_scale = max(0.2, (side_min - 80.0) / 170.0)
+            base_vy = base_vy * side_scale
+            if side_min < 150.0:
+                print(f"[SIDE_BRAKE] 侧面障碍物 {side_min:.0f}mm，横向速度缩放至 {side_scale:.2f}")
+
+        # ---- 后方防撞 ----
+        if rear_dist < 200.0 and base_vx < 0:
+            rear_scale = max(0.1, (rear_dist - 50.0) / 150.0)
+            base_vx = base_vx * rear_scale
+            print(f"[REAR_BRAKE] 后方障碍物 {rear_dist:.0f}mm，后退速度缩放至 {rear_scale:.2f}")
 
         dist_to_goal = math.hypot(self.waypoints[-1][0] - x, self.waypoints[-1][1] - y) \
                        if self.waypoints else float('inf')
@@ -1013,6 +1038,57 @@ class Navigator:
             if abs(angle) < math.radians(70):
                 front_min = min(front_min, dist)
         return front_min
+
+    def _get_left_distance(self, x, y, theta) -> float:
+        """左侧障碍物最近距离（70° ~ 110°）"""
+        _, world_pts = self.mapper.get_latest_points()
+        if not world_pts:
+            return float('inf')
+        left_min = float('inf')
+        for wx, wy in world_pts:
+            dx = wx - x
+            dy = wy - y
+            dist = math.hypot(dx, dy)
+            if dist > 2000 or dist < 20:
+                continue
+            angle = self._normalize_angle(math.atan2(dy, dx) - theta)
+            if math.radians(70) <= angle <= math.radians(110):
+                left_min = min(left_min, dist)
+        return left_min
+
+    def _get_right_distance(self, x, y, theta) -> float:
+        """右侧障碍物最近距离（-110° ~ -70°）"""
+        _, world_pts = self.mapper.get_latest_points()
+        if not world_pts:
+            return float('inf')
+        right_min = float('inf')
+        for wx, wy in world_pts:
+            dx = wx - x
+            dy = wy - y
+            dist = math.hypot(dx, dy)
+            if dist > 2000 or dist < 20:
+                continue
+            angle = self._normalize_angle(math.atan2(dy, dx) - theta)
+            if math.radians(-110) <= angle <= math.radians(-70):
+                right_min = min(right_min, dist)
+        return right_min
+
+    def _get_rear_distance(self, x, y, theta) -> float:
+        """后方障碍物最近距离（|angle| > 110°）"""
+        _, world_pts = self.mapper.get_latest_points()
+        if not world_pts:
+            return float('inf')
+        rear_min = float('inf')
+        for wx, wy in world_pts:
+            dx = wx - x
+            dy = wy - y
+            dist = math.hypot(dx, dy)
+            if dist > 2000 or dist < 20:
+                continue
+            angle = self._normalize_angle(math.atan2(dy, dx) - theta)
+            if abs(angle) > math.radians(110):
+                rear_min = min(rear_min, dist)
+        return rear_min
 
     def set_target(self, x: float, y: float, theta: float = None) -> bool:
         self.target_theta = theta
