@@ -4,6 +4,7 @@
 """Main: 静态地图导航 + 速度闭环控制下发 - 最终修复版（适配机器人半径230mm）"""
 
 import sys
+import json
 import math
 import time
 import threading
@@ -59,6 +60,7 @@ class Communicate(QObject):
     ws_clear_map = pyqtSignal()                     # 前端: 清空地图
     ws_cmd_5 = pyqtSignal()                        # 前端: 发送 "5"
     ws_cmd_6 = pyqtSignal()                        # 前端: 发送 "6"
+    ws_cmd_8 = pyqtSignal()                        # 前端: 发送 "8"
 
 
 class MainWindow(QMainWindow):
@@ -256,6 +258,7 @@ class MainWindow(QMainWindow):
         self.comm.ws_clear_map.connect(self.clear_map)
         self.comm.ws_cmd_5.connect(self._on_ws_cmd_5)
         self.comm.ws_cmd_6.connect(self._on_ws_cmd_6)
+        self.comm.ws_cmd_8.connect(self._on_ws_cmd_8)
 
         self.nav_timer = QTimer()
         self.nav_timer.timeout.connect(self.nav_step)
@@ -289,6 +292,7 @@ class MainWindow(QMainWindow):
         self._ws_cmd_5_active = False # 标记 WS_CMD_5 导航正在进行中
         self._nav_zero_active = False # 标记 NAV_ZERO 导航进行中，完成后抑制雷达直到 WS_CMD_6
         self._ws_cmd_6_active = False # 标记 WS_CMD_6 导航进行中，完成后抑制雷达直到 JAVA_NAV
+        self._ws_cmd_8_active = False # 标记 WS_CMD_8 导航进行中
         self._java_nav_active = False # 标记 JAVA_NAV 导航进行中，完成后抑制雷达直到 OpenMV 0xA2
 
         # ---- 点位文件顺序导航 ----
@@ -301,12 +305,11 @@ class MainWindow(QMainWindow):
             self._pending_obstacles = self._pending_obstacles[-2500:]
 
     def _on_java_nav_trigger(self):
-        """Java MQTT触发导航 → (1300, -175) @ 90°"""
-        print("[JAVA_NAV] 触发导航 -> (1300, -270) @ 90°")
+        """Java MQTT触发导航 → (1335, -290) @ 91°"""
+        print("[JAVA_NAV] 触发导航 -> (1335, -290) @ 91°")
         self.target_x.setText("1335")
         self.target_y.setText("-290")
         self.target_theta_deg.setText("91")
-        self._is_java_nav = True
         self._java_nav_active = True  # 标记 JAVA_NAV 导航，完成后抑制雷达直到 OpenMV 0xA2
         self._suppress_lidar = False  # 恢复雷达点云接收与绘制
         self.navigator.final_approach_dist = 10.0
@@ -314,14 +317,14 @@ class MainWindow(QMainWindow):
         if self.ws_server:
             self.ws_server.send_text("2")
         self.start_navigation()
+        self._is_java_nav = True  # start_navigation 已清除旧标志，此处只为本次 Java 导航武装 "A"
 
     def _on_nav_zero_trigger(self):
-        """MQTT "0" 触发导航 → (350, -1450) @ -90°"""
-        print("[NAV_ZERO] 触发导航 -> (320, -1395) @ -90°")
+        """MQTT "0" 触发导航 → (320, -1310) @ -90°"""
+        print("[NAV_ZERO] 触发导航 -> (320, -1310) @ -90°")
         self.target_x.setText("320")
         self.target_y.setText("-1310")
         self.target_theta_deg.setText("-90")
-        self._is_java_nav = True
         self._nav_zero_active = True   # 标记 NAV_ZERO 导航，完成后抑制雷达直到 WS_CMD_6
         self._suppress_lidar = False  # 恢复雷达点云接收与绘制
         self.navigator.final_approach_dist = 70.0
@@ -329,6 +332,7 @@ class MainWindow(QMainWindow):
         if self.ws_server:
             self.ws_server.send_text("1")
         self.start_navigation()
+        self._is_java_nav = True  # start_navigation 已清除旧标志，此处只为本次 NAV_ZERO 导航武装 "A"
 
     def _on_ws_cmd_5(self):
         """前端 WebSocket 发送 "5" → 触发导航（帧数>30后由前端确认启动）"""
@@ -337,6 +341,8 @@ class MainWindow(QMainWindow):
         self.target_y.setText("-70")
         self.target_theta_deg.setText("-5")
         self.navigator._nav_count = 0  # 确保作为首次导航，走起点保护流程
+        self._is_java_nav = False     # 复位，确保 WS_CMD_5 完成不会发 "A"
+        self._is_openmv_nav = False   # 复位，确保不会误发 "0"
         self._ws_cmd_5_active = True
         self.start_navigation()
 
@@ -347,7 +353,21 @@ class MainWindow(QMainWindow):
         self.target_y.setText("-1520")
         self.target_theta_deg.setText("-180")
         self._suppress_lidar = False  # 恢复雷达点云接收与绘制
+        self._is_java_nav = False     # 复位，确保 WS_CMD_6 完成不会发 "A"
+        self._is_openmv_nav = False   # 复位，确保不会误发 "0"
         self._ws_cmd_6_active = True  # 标记 WS_CMD_6 导航，完成后抑制雷达直到 JAVA_NAV
+        self.start_navigation()
+
+    def _on_ws_cmd_8(self):
+        """前端 WebSocket 发送 "8" → 导航至 (1470, -540) @ 90°"""
+        print("[WS_CMD_8] 前端触发 → 导航至 (1470, -540) @ 90°")
+        self.target_x.setText("1470")
+        self.target_y.setText("-540")
+        self.target_theta_deg.setText("90")
+        self._suppress_lidar = False  # 恢复雷达点云接收与绘制
+        self._is_java_nav = False     # 复位 Java/NAV_ZERO 标志，避免 WS_CMD_8 完成时误发 "A"
+        self._is_openmv_nav = False   # 复位 OpenMV 标志，避免误发 "0" 给前端
+        self._ws_cmd_8_active = True
         self.start_navigation()
 
     def _on_openmv_data(self, data: bytes):
@@ -361,7 +381,7 @@ class MainWindow(QMainWindow):
             cmd = data[0]
             if cmd == 0xA2:
                 self._openmv_a2_count += 1
-                if self._openmv_a2_count == 1:
+                if self._openmv_a2_count <= 2 :
                     print(f"[OPENMV] 第1次收到 0xA2 → 跳过，不导航")
                     self.openmv_label.setText(f"OpenMV: 0xA2 (#1) → 跳过")
                     self.openmv_label.setStyleSheet(
@@ -377,6 +397,7 @@ class MainWindow(QMainWindow):
                     self.target_x.setText(tx)
                     self.target_y.setText(ty)
                     self.target_theta_deg.setText(tdeg)
+                    self._is_java_nav = False     # 复位，确保 OpenMV 导航完成不会发 "A"
                     self._is_openmv_nav = True
                     self._suppress_lidar = False  # 恢复雷达点云接收与绘制
                     self.start_navigation()
@@ -407,6 +428,8 @@ class MainWindow(QMainWindow):
         self.nav_target_label.setStyleSheet(
             "font-size: 12px; color: #00ffaa; line-height: 1.4;"
         )
+        self._is_java_nav = False     # 复位，确保手动/地图导航完成不会发 "A"
+        self._is_openmv_nav = False   # 复位，确保不会误发 "0"
         self.start_navigation()
 
     def handle_ws_map_click(self, img_x: int, img_y: int, img_w: int, img_h: int):
@@ -510,6 +533,8 @@ class MainWindow(QMainWindow):
         print(f"[WP] 启动点位 [{index+1}/{len(self._waypoint_list)}] "
               f"\"{name}\" → ({tx:.0f}, {ty:.0f}) @{ttheta_deg:.0f}°")
 
+        self._is_java_nav = False     # 复位，确保点位顺序导航完成不会发 "A"
+        self._is_openmv_nav = False   # 复位，确保不会误发 "0"
         self.start_navigation()
 
     def _process_pending_obstacles(self):
@@ -541,6 +566,10 @@ class MainWindow(QMainWindow):
             traceback.print_exc()
 
     def start_navigation(self):
+        # 每次启动新导航先清除残留的 Java/OpenMV 标志，保证不会跨导航误发 "A"/"0"
+        _prev_java = self._is_java_nav  # 诊断：清除前的标志状态
+        self._is_java_nav = False
+        self._is_openmv_nav = False
         # ===== 可选：检查地图是否有足够障碍物信息 =====
         # 注释掉，用户可按需取消注释
         # occ_count = np.count_nonzero(self.mapper.map.log_odds > self.mapper.map.occ_thresh)
@@ -555,6 +584,7 @@ class MainWindow(QMainWindow):
             ttheta_deg = float(self.target_theta_deg.text())
             ttheta_rad = math.radians(ttheta_deg)
 
+            print(f"[NAV_START] target=({tx:.0f},{ty:.0f})@{ttheta_deg:.0f}° prev_java={_prev_java}")
             success = self.navigator.set_target(tx, ty, ttheta_rad)
 
             if success:
@@ -611,38 +641,31 @@ class MainWindow(QMainWindow):
             print(f"[WP] OpenMV信号发送失败: {e}")
 
     def send_last_waypoint_frame(self):
-        """到达最后点位后，发送 0xA2 帧到 ESP32"""
+        """到达最后点位后，发送 JSON 完成信号 {"data":"A"} 到 ESP32"""
         if self.client is None or not self.client.is_connected():
-            print("[WP] MQTT未连接，无法发送最后点位完成帧")
+            print("[WP] MQTT未连接，无法发送最后点位完成信号")
             return
 
-        frame = bytearray()
-        frame.append(0xCC)
-        frame.append(0x66)
-        frame.append(0x01)
-        frame.append(0xA2)
-        checksum = sum(frame[2:]) & 0xFF
-        frame.append(checksum)
-        frame.append(0xEE)
+        msg = json.dumps({"data": "A"})
 
         try:
-            self.client.publish(TOPIC_CONTROL, bytes(frame), qos=1)
-            hex_str = ' '.join(f'{b:02X}' for b in frame)
-            print(f"[WP] 最后点位完成帧已发送 -> {TOPIC_CONTROL} | HEX[{hex_str}]")
+            self.client.publish(TOPIC_CONTROL, msg, qos=1)
+            print(f"[WP] 最后点位完成信号已发送 -> {TOPIC_CONTROL} | {msg}")
         except Exception as e:
-            print(f"[WP] 最后点位完成帧发送失败: {e}")
+            print(f"[WP] 最后点位完成信号发送失败: {e}")
 
     def on_manual_send_ack(self):
-        self.send_last_waypoint_frame()
+        self._is_java_nav = False     # 复位，确保手动取消不会发 "A"
+        self._is_openmv_nav = False   # 复位
         self._alignment_ack_done = True
         self.navigator.cancel()
         self.navigator._align_settle_until = 0.0
         self.navigator._alignment_ack_sent = False
         self.navigator._send_alignment_ack = False
         self.navigator._align_stable_count = 0
-        self.nav_status.setText("导航: 手动发送完成帧")
+        self.nav_status.setText("导航: 手动取消")
         self.nav_status.setStyleSheet("font-size: 13px; color: #3366aa;")
-        self.set_status("已手动发送 0xA2 完成帧，速度下发已停止", "blue")
+        self.set_status("已手动取消导航，速度下发已停止", "blue")
 
     def on_hold_pressed(self):
         try:
@@ -669,6 +692,8 @@ class MainWindow(QMainWindow):
 
     def stop_navigation(self):
         self.navigator.cancel()
+        self._is_java_nav = False     # 复位，确保停止导航不会发 "A"
+        self._is_openmv_nav = False   # 复位
         self.send_velocity_command(0.0, 0.0, 0.0)
         self.nav_status.setText("导航: 已停止")
         self.nav_status.setStyleSheet("font-size: 13px; color: #ff6666;")
@@ -695,6 +720,9 @@ class MainWindow(QMainWindow):
             if self._nav_was_active:
                 self.send_velocity_command(0.0, 0.0, 0.0)
                 self._nav_was_active = False
+                print(f"[NAV_DONE] state={self.navigator.state} _is_java_nav={self._is_java_nav} "
+                      f"target=({self.target_x.text()},{self.target_y.text()}@{self.target_theta_deg.text()}°) "
+                      f"wp_list_len={len(self._waypoint_list)} idx={self._waypoint_index}")
 
                 # ---- WS_CMD_5 导航完成 → 开始抑制雷达点云（直到 _on_nav_zero_trigger） ----
                 if self._ws_cmd_5_active and self.navigator.state == "DONE":
@@ -721,14 +749,11 @@ class MainWindow(QMainWindow):
                     # 延迟一帧再启动，确保状态已完全清理
                     QTimer.singleShot(500, lambda idx=self._waypoint_index: self._start_waypoint(idx))
 
-                # ---- 最后点位完成 → 发送 0xA2 帧到 ESP32 ----
-                elif (self.navigator.state == "DONE"
-                        and self._waypoint_list
-                        and self._waypoint_index + 1 >= len(self._waypoint_list)):
-                    self.send_last_waypoint_frame()
-
-                # ---- MQTT "2" 导航完成 → 发送 0xA2 帧到 ESP32 ----
+                # ---- MQTT "2"/"0"（Java/NAV_ZERO）导航完成 → 发送 "A" 到 ESP32 ----
+                #     只有这两个点位触发会发送 "A"；点位顺序导航最后一点不再发送
                 elif self.navigator.state == "DONE" and self._is_java_nav:
+                    print(f"[A-SEND] 发送\"A\" | 目标=({self.target_x.text()},{self.target_y.text()}@{self.target_theta_deg.text()}°) "
+                          f"state={self.navigator.state}")
                     self.send_last_waypoint_frame()
                     self._is_java_nav = False
 
@@ -755,6 +780,17 @@ class MainWindow(QMainWindow):
                         self.mapper.latest_points_local = []
                         self.mapper.latest_points_world = []
                     print("[LIDAR] WS_CMD_6 导航完成，开始抑制雷达点云接收与绘制（等待 JAVA_NAV 触发）")
+
+                # ---- WS_CMD_8 导航完成 → 抑制雷达点云 ----
+                if self._ws_cmd_8_active and self.navigator.state == "DONE":
+                    self._suppress_lidar = True
+                    self._ws_cmd_8_active = False
+                    if self.ws_server:
+                        self.ws_server.send_text("e")
+                    with self.mapper.lock:
+                        self.mapper.latest_points_local = []
+                        self.mapper.latest_points_world = []
+                    print("[LIDAR] WS_CMD_8 导航完成，开始抑制雷达点云接收与绘制")
 
                 # ---- JAVA_NAV 导航完成 → 抑制雷达点云，等待 OpenMV 0xA2 ----
                 if self._java_nav_active and self.navigator.state == "DONE":
@@ -878,9 +914,9 @@ class MainWindow(QMainWindow):
         if self.client is None or not self.client.is_connected():
             return
 
-        # 合速度不低于80mm/s（合速度不为零但低于阈值时，按比例放大）
+        # 合速度不低于80mm/s（紧急避障后退时跳过，直接发原始低速）
         speed = math.hypot(vx, vy)
-        if speed > 0.01 and speed < 80.0:
+        if speed > 0.01 and speed < 80.0 and self.navigator.state != "EVADE_EMERGENCY":
             scale = 80.0 / speed
             vx *= scale
             vy *= scale
@@ -1323,6 +1359,7 @@ def main():
     ws_server.on_clear_map(lambda: comm.ws_clear_map.emit())
     ws_server.on_cmd_5(lambda: comm.ws_cmd_5.emit())
     ws_server.on_cmd_6(lambda: comm.ws_cmd_6.emit())
+    ws_server.on_cmd_8(lambda: comm.ws_cmd_8.emit())
     window.show()
 
     proc_thread = threading.Thread(

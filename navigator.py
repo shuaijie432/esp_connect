@@ -35,7 +35,7 @@ class Navigator:
 
         # ★ A* 硬膨胀 = 22格 = 220mm（覆盖对角线半长184mm + 36mm余量）
         #    确保车身蓝色方框的四个角也不会进入膨胀区
-        self.obstacle_margin = 16
+        self.obstacle_margin = 20
 
         # ★ DWA 碰撞框参数
         self.channel_margin_mm = 100.0        # 通道余量（80→100）
@@ -122,7 +122,7 @@ class Navigator:
 
         # 合速度速率限制器（防止突变）
         self._last_output_speed = 0.0           # 上一帧下发的合速度
-        self.MIN_COMBINED_SPEED = 65.0          # 最低合速度 mm/s
+        self.MIN_COMBINED_SPEED = 75.0          # 最低合速度 mm/s
         self.MAX_SPEED_DELTA = 35.0             # 每步最大加速量 (100ms步长 → 350mm/s²)
         self.MAX_SPEED_DELTA_BRAKE = 60.0       # 每步最大减速量 (允许更快刹车)
 
@@ -948,8 +948,8 @@ class Navigator:
         speed = math.hypot(vx, vy)
 
         if speed > 0.01:
-            # 1. 强制最低合速度
-            if speed < self.MIN_COMBINED_SPEED:
+            # 1. 强制最低合速度（紧急避障后退时跳过，直接发原始低速）
+            if speed < self.MIN_COMBINED_SPEED and self.state != "EVADE_EMERGENCY":
                 scale = self.MIN_COMBINED_SPEED / speed
                 vx *= scale
                 vy *= scale
@@ -1763,6 +1763,7 @@ class Navigator:
 
         print("[EVADE] 所有方向受阻，慢速后退")
         return -50.0, 0.0, 0.0
+
 
     def get_status(self) -> str:
         if self.state == "IDLE":
