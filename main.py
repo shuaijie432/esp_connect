@@ -29,7 +29,7 @@ from navigator import Navigator
 from laser_odometry import LaserOdometry
 from ws_server import WebSocketServer
 
-MQTT_HOST = "10.113.145.227"
+MQTT_HOST = "10.119.74.227"
 MQTT_PORT = 1883
 MQTT_USER = "esp_send"
 MQTT_PASS = "00000000"
@@ -307,7 +307,7 @@ class MainWindow(QMainWindow):
     def _on_java_nav_trigger(self):
         """Java MQTT触发导航 → (1335, -290) @ 91°"""
         print("[JAVA_NAV] 触发导航 -> (1335, -290) @ 91°")
-        self.target_x.setText("1335")
+        self.target_x.setText("1315")
         self.target_y.setText("-290")
         self.target_theta_deg.setText("91")
         self._java_nav_active = True  # 标记 JAVA_NAV 导航，完成后抑制雷达直到 OpenMV 0xA2
@@ -361,7 +361,7 @@ class MainWindow(QMainWindow):
     def _on_ws_cmd_8(self):
         """前端 WebSocket 发送 "8" → 导航至 (1470, -540) @ 90°"""
         print("[WS_CMD_8] 前端触发 → 导航至 (1470, -540) @ 90°")
-        self.target_x.setText("1470")
+        self.target_x.setText("1450")
         self.target_y.setText("-540")
         self.target_theta_deg.setText("90")
         self._suppress_lidar = False  # 恢复雷达点云接收与绘制
