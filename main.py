@@ -37,6 +37,8 @@ TOPIC_LIDAR = "esp/f79541/data"
 TOPIC_CONTROL = "device/f79541/data"
 TOPIC_OPENMV  = "openmv/nav"
 TOPIC_OPENMV_RECV = "openmv/data"      # 接收 OpenMV 发来的数据
+TOPIC_JAVA = "device/java/data"        # 发送给 Java 端的数据
+TOPIC_PYTHON_TASK = "python/task"      # 接收 Python 任务指令（如 {"action":"5"}）
 
 
 MAP_SIZE_MM = 8000
@@ -382,8 +384,19 @@ class MainWindow(QMainWindow):
             if cmd == 0xA2:
                 self._openmv_a2_count += 1
                 if self._openmv_a2_count <= 2 :
-                    print(f"[OPENMV] 第1次收到 0xA2 → 跳过，不导航")
-                    self.openmv_label.setText(f"OpenMV: 0xA2 (#1) → 跳过")
+                    print(f"[OPENMV] 第{self._openmv_a2_count}次收到 0xA2 → 跳过，不导航")
+                    self.ws_server.send_text("0")  # 通知前端 {"action":"text","data":"0"}
+                    # 发送 {"action":"text","data":"0"} 到 Java 端
+                    if self.client is not None and self.client.is_connected():
+                        try:
+                            java_msg = json.dumps({"action": "text", "data": "0"})
+                            self.client.publish(TOPIC_JAVA, java_msg, qos=1)
+                            print(f"[OPENMV] → 已发送 Java: {TOPIC_JAVA} | {java_msg}")
+                        except Exception as e:
+                            print(f"[OPENMV] Java消息发送失败: {e}")
+                    else:
+                        print("[OPENMV] MQTT未连接，无法发送Java消息")
+                    self.openmv_label.setText(f"OpenMV: 0xA2 (#{self._openmv_a2_count}) → 跳过")
                     self.openmv_label.setStyleSheet(
                         "font-size: 12px; line-height: 1.4; color: #ffcc00;"
                     )
@@ -398,15 +411,17 @@ class MainWindow(QMainWindow):
                     self.target_y.setText(ty)
                     self.target_theta_deg.setText(tdeg)
                     self._is_java_nav = False     # 复位，确保 OpenMV 导航完成不会发 "A"
-                    self._is_openmv_nav = True
                     self._suppress_lidar = False  # 恢复雷达点云接收与绘制
+                    self.ws_server.send_text("10")  # 通知前端 {"action":"text","data":"10"}
                     self.start_navigation()
+                    self._is_openmv_nav = True    # 在 start_navigation 之后武装：start_navigation 会清除旧标志，此处武装确保完成后不发 "1" 给 OpenMV
             elif cmd == 0x02:
                 self.openmv_label.setText(f"OpenMV: 收到指令 0x02")
                 self.openmv_label.setStyleSheet(
                     "font-size: 12px; line-height: 1.4; color: #ffcc00;"
                 )
                 print("[OPENMV] → 指令 0x02")
+                self.ws_server.send_text("0")  # 通知前端 {"action":"text","data":"0"}
             else:
                 self.openmv_label.setText(f"OpenMV: 0x{cmd:02X}")
                 self.openmv_label.setStyleSheet(
@@ -1107,8 +1122,10 @@ def create_mqtt_client(frame_queue: Queue, comm: Communicate):
             print(f"[MQTT] 已连接到 {MQTT_HOST}:{MQTT_PORT}")
             client.subscribe(TOPIC_LIDAR, qos=0)
             client.subscribe(TOPIC_OPENMV_RECV, qos=0)
+            client.subscribe(TOPIC_PYTHON_TASK, qos=0)
             print(f"[MQTT] 已订阅 {TOPIC_LIDAR}")
             print(f"[MQTT] 已订阅 {TOPIC_OPENMV_RECV} (OpenMV接收)")
+            print(f"[MQTT] 已订阅 {TOPIC_PYTHON_TASK} (Python任务)")
             comm.status_msg.emit(f"已连接 - {MQTT_HOST}", "green")
         else:
             print(f"[MQTT] 连接失败: {rc}")
@@ -1162,6 +1179,19 @@ def create_mqtt_client(frame_queue: Queue, comm: Communicate):
             hex_str = ' '.join(f'{b:02X}' for b in raw_bytes)
             print(f"[OPENMV] 收到: {hex_str}")
             comm.openmv_data.emit(raw_bytes)
+            return
+
+        # ---- python/task 任务指令 ----
+        if msg.topic == TOPIC_PYTHON_TASK:
+            try:
+                task_msg = json.loads(msg.payload.decode('utf-8'))
+            except Exception:
+                task_msg = None
+            if task_msg and task_msg.get("action") == "5":
+                print(f"[TASK] 收到 {{'action':'5'}} → 触发 WS_CMD_5 导航")
+                comm.ws_cmd_5.emit()
+            else:
+                print(f"[TASK] 收到未识别指令: {msg.payload}")
             return
 
     def on_disconnect(client, userdata, rc):
