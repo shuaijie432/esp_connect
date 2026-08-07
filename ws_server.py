@@ -264,6 +264,9 @@ class WebSocketServer:
         elif action == "6":
             if self._on_cmd_6:
                 self._on_cmd_6()
+        elif action == "7":
+            if self._on_cmd_7:
+                self._on_cmd_7()
         elif action == "8":
             if self._on_cmd_8:
                 self._on_cmd_8()
@@ -276,6 +279,7 @@ class WebSocketServer:
     _on_map_click = None
     _on_cmd_5 = None
     _on_cmd_6 = None
+    _on_cmd_7 = None
     _on_cmd_8 = None
 
     def on_set_target(self, callback):
@@ -298,6 +302,9 @@ class WebSocketServer:
 
     def on_cmd_6(self, callback):
         self._on_cmd_6 = callback
+
+    def on_cmd_7(self, callback):
+        self._on_cmd_7 = callback
 
     def on_cmd_8(self, callback):
         self._on_cmd_8 = callback

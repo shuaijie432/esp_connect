@@ -62,6 +62,7 @@ class Communicate(QObject):
     ws_clear_map = pyqtSignal()                     # 前端: 清空地图
     ws_cmd_5 = pyqtSignal()                        # 前端: 发送 "5"
     ws_cmd_6 = pyqtSignal()                        # 前端: 发送 "6"
+    ws_cmd_7 = pyqtSignal()                        # 前端: 发送 "7"
     ws_cmd_8 = pyqtSignal()                        # 前端: 发送 "8"
 
 
@@ -260,6 +261,7 @@ class MainWindow(QMainWindow):
         self.comm.ws_clear_map.connect(self.clear_map)
         self.comm.ws_cmd_5.connect(self._on_ws_cmd_5)
         self.comm.ws_cmd_6.connect(self._on_ws_cmd_6)
+        self.comm.ws_cmd_7.connect(self._on_ws_cmd_7)
         self.comm.ws_cmd_8.connect(self._on_ws_cmd_8)
 
         self.nav_timer = QTimer()
@@ -294,6 +296,7 @@ class MainWindow(QMainWindow):
         self._ws_cmd_5_active = False # 标记 WS_CMD_5 导航正在进行中
         self._nav_zero_active = False # 标记 NAV_ZERO 导航进行中，完成后抑制雷达直到 WS_CMD_6
         self._ws_cmd_6_active = False # 标记 WS_CMD_6 导航进行中，完成后抑制雷达直到 JAVA_NAV
+        self._ws_cmd_7_active = False # 标记 WS_CMD_7 导航进行中，完成后抑制雷达直到 JAVA_NAV
         self._ws_cmd_8_active = False # 标记 WS_CMD_8 导航进行中
         self._java_nav_active = False # 标记 JAVA_NAV 导航进行中，完成后抑制雷达直到 OpenMV 0xA2
 
@@ -358,6 +361,18 @@ class MainWindow(QMainWindow):
         self._is_java_nav = False     # 复位，确保 WS_CMD_6 完成不会发 "A"
         self._is_openmv_nav = False   # 复位，确保不会误发 "0"
         self._ws_cmd_6_active = True  # 标记 WS_CMD_6 导航，完成后抑制雷达直到 JAVA_NAV
+        self.start_navigation()
+
+    def _on_ws_cmd_7(self):
+        """前端 WebSocket 发送 "7" → 导航至 (1205, 820) @ 0°"""
+        print("[WS_CMD_7] 前端触发 → 导航至 (1205, -820) @ 0°")
+        self.target_x.setText("1225")
+        self.target_y.setText("-820")
+        self.target_theta_deg.setText("0")
+        self._suppress_lidar = False  # 恢复雷达点云接收与绘制
+        self._is_java_nav = False     # 复位，确保 WS_CMD_7 完成不会发 "A"
+        self._is_openmv_nav = False   # 复位，确保不会误发 "0"
+        self._ws_cmd_7_active = True  # 标记 WS_CMD_7 导航，完成后抑制雷达直到 JAVA_NAV
         self.start_navigation()
 
     def _on_ws_cmd_8(self):
@@ -795,6 +810,18 @@ class MainWindow(QMainWindow):
                         self.mapper.latest_points_local = []
                         self.mapper.latest_points_world = []
                     print("[LIDAR] WS_CMD_6 导航完成，开始抑制雷达点云接收与绘制（等待 JAVA_NAV 触发）")
+
+                # ---- WS_CMD_7 导航完成 → 抑制雷达点云，等待 JAVA_NAV ----
+                if self._ws_cmd_7_active and self.navigator.state == "DONE":
+                    self._suppress_lidar = True
+                    self._ws_cmd_7_active = False
+                    # 推送 "f" 给前端，通知已到达 WS_CMD_7 点位
+                    if self.ws_server:
+                        self.ws_server.send_text("f")
+                    with self.mapper.lock:
+                        self.mapper.latest_points_local = []
+                        self.mapper.latest_points_world = []
+                    print("[LIDAR] WS_CMD_7 导航完成，开始抑制雷达点云接收与绘制（等待 JAVA_NAV 触发）")
 
                 # ---- WS_CMD_8 导航完成 → 抑制雷达点云 ----
                 if self._ws_cmd_8_active and self.navigator.state == "DONE":
@@ -1389,6 +1416,7 @@ def main():
     ws_server.on_clear_map(lambda: comm.ws_clear_map.emit())
     ws_server.on_cmd_5(lambda: comm.ws_cmd_5.emit())
     ws_server.on_cmd_6(lambda: comm.ws_cmd_6.emit())
+    ws_server.on_cmd_7(lambda: comm.ws_cmd_7.emit())
     ws_server.on_cmd_8(lambda: comm.ws_cmd_8.emit())
     window.show()
 

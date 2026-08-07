@@ -122,7 +122,7 @@ class Navigator:
 
         # 合速度速率限制器（防止突变）
         self._last_output_speed = 0.0           # 上一帧下发的合速度
-        self.MIN_COMBINED_SPEED = 70.0          # 最低合速度 mm/s
+        self.MIN_COMBINED_SPEED = 85.0          # 最低合速度 mm/s
         self.MAX_SPEED_DELTA = 35.0             # 每步最大加速量 (100ms步长 → 350mm/s²)
         self.MAX_SPEED_DELTA_BRAKE = 60.0       # 每步最大减速量 (允许更快刹车)
 
