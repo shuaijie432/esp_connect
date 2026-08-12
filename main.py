@@ -19,7 +19,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSplitter, QLineEdit
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject  , QPoint, QRect
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject  , QPoint
 from PyQt5.QtGui import QFont
 
 from lidar_parser import parse_frame
@@ -958,8 +958,8 @@ class MainWindow(QMainWindow):
 
         # 合速度不低于80mm/s（紧急避障后退时跳过，直接发原始低速）
         speed = math.hypot(vx, vy)
-        if speed > 0.01 and speed < 80.0 and self.navigator.state != "EVADE_EMERGENCY":
-            scale = 80.0 / speed
+        if speed > 0.01 and speed < 45.0 and self.navigator.state != "EVADE_EMERGENCY":
+            scale = 75.0 / speed
             vx *= scale
             vy *= scale
 
@@ -1011,35 +1011,9 @@ class MainWindow(QMainWindow):
             self.loop_label.setText("闭环: ✗ 未闭合")
             self.loop_label.setStyleSheet("font-size: 14px; color: #ff6666; font-weight: bold;")
 
-        # WebSocket 广播：截图推送 GUI 界面到 Vue 前端（仅好果+坏果存放区）
+        # WebSocket 状态广播（不再推送 GUI 截图，避免阻塞主线程、拖慢导航控制）
         if self.ws_server:
             self.ws_server.broadcast_full_state()
-            # 计算棕色框在主窗口上的屏幕区域
-            mv = self.map_view
-            cr = mv.crop_rect
-            cx_c, cy_c = cr.x(), cr.y()        # 中心世界坐标
-            cw_mm, ch_mm = cr.width(), cr.height()  # 宽高 mm
-            mw, mh = mv.width(), mv.height()
-            # 四个角的世界坐标 → MapWidget 屏幕坐标
-            corners = [
-                mv.world_to_screen(cx_c - cw_mm/2, cy_c - ch_mm/2, mw, mh),
-                mv.world_to_screen(cx_c + cw_mm/2, cy_c - ch_mm/2, mw, mh),
-                mv.world_to_screen(cx_c - cw_mm/2, cy_c + ch_mm/2, mw, mh),
-                mv.world_to_screen(cx_c + cw_mm/2, cy_c + ch_mm/2, mw, mh),
-            ]
-            min_sx = min(p[0] for p in corners)
-            min_sy = min(p[1] for p in corners)
-            max_sx = max(p[0] for p in corners)
-            max_sy = max(p[1] for p in corners)
-            # MapWidget 在窗口中的偏移
-            map_pos = mv.mapTo(self, QPoint(0, 0))
-            crop_rect = QRect(
-                map_pos.x() + int(min_sx),
-                map_pos.y() + int(min_sy),
-                int(max_sx - min_sx),
-                int(max_sy - min_sy),
-            )
-            self.ws_server.broadcast_window_image(quality=95, crop_rect=crop_rect)
 
     def update_odom_display(self):
         odom_stats = self.mapper.get_odom_stats()
